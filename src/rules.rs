@@ -26,6 +26,11 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
+/// A transfer speed: "300 КБ/с", "1.2 ГБ/с".
+pub fn rate(bytes_per_sec: f64) -> String {
+    format!("{}/с", size(bytes_per_sec.max(0.0) as u64))
+}
+
 /// "16 ГБ  ·  DDR4"; "Неизвестно" when the size is not known.
 pub fn memory_line(bytes: u64, mem_type: &str) -> String {
     if bytes == 0 {

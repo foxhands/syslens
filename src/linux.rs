@@ -581,6 +581,119 @@ fn apps() -> Vec<Value> {
     found.into_values().map(|(n, c)| json!({ "Name": n, "Version": "", "Publisher": c })).collect()
 }
 
+/// One key of a .desktop file's main section ("Exec").
+pub fn desktop_key(text: &str, key: &str) -> String {
+    let mut inside = false;
+    for l in text.lines() {
+        let l = l.trim();
+        if l.starts_with('[') {
+            inside = l == "[Desktop Entry]";
+        } else if inside {
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim() == key {
+                    return v.trim().to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// Laptop batteries from /sys/class/power_supply, and their capacity figures.
+fn batteries() -> (Vec<Value>, Value) {
+    let mut bats = Vec::new();
+    let (mut full, mut design, mut cycles) = (0u64, 0u64, 0u64);
+    let mut unit = "мВт·ч";
+    for p in dirs("/sys/class/power_supply") {
+        // "Device" scope is a mouse or a headset, not the computer's own battery
+        if read(p.join("type")) != "Battery" || read(p.join("scope")) == "Device" {
+            continue;
+        }
+        let num = |k: &str| read(p.join(k)).parse::<u64>().unwrap_or(0);
+        let status = match read(p.join("status")).as_str() {
+            "Discharging" => 1,
+            "Full" => 3,
+            "Charging" => 6,
+            _ => 2,
+        };
+        let name = format!("{} {}", clean(&read(p.join("manufacturer"))), clean(&read(p.join("model_name"))));
+        bats.push(json!({
+            "Name": name.trim(),
+            "EstimatedChargeRemaining": num("capacity"),
+            "BatteryStatus": status,
+        }));
+        // Some batteries count energy (µWh), others charge (µAh).
+        let (f, d) = if num("energy_full") > 0 {
+            (num("energy_full"), num("energy_full_design"))
+        } else {
+            unit = "мА·ч";
+            (num("charge_full"), num("charge_full_design"))
+        };
+        full += f / 1000;
+        design += d / 1000;
+        cycles = cycles.max(num("cycle_count"));
+    }
+    (bats, json!({ "Full": full, "Design": design, "Cycles": cycles, "Unit": unit }))
+}
+
+/// Programs started with the desktop session.
+fn autostart() -> Vec<Value> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = Vec::new();
+    for dir in [format!("{home}/.config/autostart"), "/etc/xdg/autostart".to_string()] {
+        for f in dirs(&dir) {
+            if f.extension().map_or(true, |e| e != "desktop") {
+                continue;
+            }
+            let text = fs::read_to_string(&f).unwrap_or_default();
+            if let Some((name, _)) = desktop_entry(&text) {
+                out.push(json!({ "Name": name, "Command": desktop_key(&text, "Exec"), "Location": dir }));
+            }
+        }
+    }
+    out
+}
+
+/// First word of every line: unit names from `systemctl ... --no-legend --plain`.
+pub fn first_words(text: &str) -> Vec<String> {
+    text.lines().filter_map(|l| l.split_whitespace().next()).map(str::to_string).collect()
+}
+
+/// Services that start with the system, and whether they run now.
+fn services() -> Vec<Value> {
+    let list = |args: &[&str]| run("systemctl", args).map(|t| first_words(&t)).unwrap_or_default();
+    let running: BTreeSet<String> =
+        list(&["list-units", "--type=service", "--state=running", "--no-legend", "--plain", "--no-pager"]).into_iter().collect();
+    list(&["list-unit-files", "--type=service", "--state=enabled", "--no-legend", "--no-pager"])
+        .into_iter()
+        .map(|name| {
+            let state = if running.contains(&name) { "Running" } else { "Stopped" };
+            json!({ "DisplayName": name.trim_end_matches(".service"), "Name": name, "State": state })
+        })
+        .collect()
+}
+
+/// Devices plugged into USB (the computer's own hubs left out).
+fn usb_devices() -> Vec<Value> {
+    dirs("/sys/bus/usb/devices")
+        .iter()
+        .filter(|p| !file_name(p).starts_with("usb"))
+        .filter_map(|p| {
+            let name = read(p.join("product"));
+            if name.is_empty() {
+                return None;
+            }
+            Some(json!({ "Name": name, "Manufacturer": read(p.join("manufacturer")) }))
+        })
+        .collect()
+}
+
+fn printers() -> Vec<Value> {
+    run("lpstat", &["-e"])
+        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(|l| json!({ "Name": l.trim() })).collect())
+        .unwrap_or_default()
+}
+
 /// Everything, in the shape of the Windows script's output.
 pub fn collect() -> Result<Value, String> {
     let mem = meminfo(&fs::read_to_string("/proc/meminfo").unwrap_or_default());
@@ -608,6 +721,7 @@ pub fn collect() -> Result<Value, String> {
         domain.clear();
     }
     let os_name = osr.get("PRETTY_NAME").or(osr.get("NAME")).cloned().unwrap_or_else(|| "Linux".into());
+    let (bat, batx) = batteries();
 
     Ok(json!({
         "cs": {
@@ -659,6 +773,12 @@ pub fn collect() -> Result<Value, String> {
         "net": net,
         "ip": ip,
         "apps": apps(),
+        "bat": bat,
+        "batx": batx,
+        "startup": autostart(),
+        "services": services(),
+        "usb": usb_devices(),
+        "printers": printers(),
     }))
 }
 
@@ -720,6 +840,8 @@ mod tests {
             Some(("Firefox".into(), "Web Browser".into()))
         );
         assert_eq!(desktop_entry("[Desktop Entry]\nType=Application\nName=Hidden\nNoDisplay=true\n"), None);
+        assert_eq!(desktop_key("[Desktop Entry]\nName=A\nExec=a --start\n[Other]\nExec=b\n", "Exec"), "a --start");
+        assert_eq!(first_words("ssh.service enabled enabled\n  cups.service  enabled\n\n"), vec!["ssh.service", "cups.service"]);
 
         let mut e = vec![0u8; 128];
         e[..8].copy_from_slice(&[0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0]);

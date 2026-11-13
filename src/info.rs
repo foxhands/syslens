@@ -45,9 +45,22 @@ impl Section {
 }
 
 /// Installed programs from the system's uninstall list: name → version, publisher, date, size.
-fn apps(d: &Value) -> Page {
+fn apps(d: &Value, sort: AppSort) -> Page {
     let mut p = Page::new();
-    let list = list(d, "apps");
+    let mut list = list(d, "apps");
+    let date = |a: &Value| Some(s(a, "Date")).filter(|x| x.len() == 8 && x.chars().all(|c| c.is_ascii_digit()));
+    list.sort_by_key(|a| s(a, "Name").to_lowercase());
+    match sort {
+        AppSort::Name => {}
+        AppSort::Size => list.sort_by(|a, b| n(b, "SizeKb").unwrap_or(0.0).total_cmp(&n(a, "SizeKb").unwrap_or(0.0))),
+        AppSort::Date => list.sort_by(|a, b| date(b).cmp(&date(a))), // newest first, undated last
+        AppSort::Publisher => {
+            list.sort_by_key(|a| {
+                let publ = s(a, "Publisher").to_lowercase();
+                (publ.is_empty(), publ)
+            })
+        }
+    }
     let sec = p.section(&format!("Установленные программы ({})", list.len()));
     for a in &list {
         let mut parts = Vec::new();
@@ -76,6 +89,9 @@ fn apps(d: &Value) -> Page {
                 format!("{} КБ", kb as u64)
             });
         }
+        if a.get("Store") == Some(&Value::Bool(true)) {
+            parts.push("Microsoft Store".into());
+        }
         if parts.is_empty() {
             parts.push("—".into());
         }
@@ -92,24 +108,41 @@ pub fn collect() -> Result<Value, String> {
     collect_windows()
 }
 
-/// Runs the Windows collection script and returns its JSON.
+/// The script as two scripts that can run at the same time: hardware, and
+/// programs with devices. Each gets the opening lines and the closing line.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn script_halves() -> [String; 2] {
+    let (first, second) = SCRIPT.split_once("# --- SECOND HALF ---").unwrap_or((SCRIPT, ""));
+    let head: String = SCRIPT.lines().take(3).map(|l| format!("{l}\n")).collect();
+    let tail = SCRIPT.trim_end().lines().last().unwrap_or_default();
+    // "#" keeps the rest of the marker line a comment
+    [format!("{first}\n{tail}\n"), format!("{head}#{second}")]
+}
+
+/// Runs both halves of the Windows collection script side by side and joins
+/// their answers: together they take about as long as the slower one.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 fn collect_windows() -> Result<Value, String> {
-    use std::io::Read;
+    let [first, second] = script_halves();
+    let side = std::thread::spawn(move || run_script(second));
+    let mut all = run_script(first)?;
+    // Programs and devices are extra: without them the hardware pages still work.
+    if let (Some(all), Ok(Ok(Value::Object(more)))) = (all.as_object_mut(), side.join()) {
+        all.extend(more);
+    }
+    Ok(all)
+}
+
+/// Runs one PowerShell script and returns its JSON.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn run_script(script: String) -> Result<Value, String> {
+    use std::io::{Read, Write};
     use std::process::Stdio;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    // Each run gets its own script file, so two runs never share one.
-    static RUN: AtomicU32 = AtomicU32::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "syslens_{}_{}.ps1",
-        std::process::id(),
-        RUN.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&path, SCRIPT).map_err(|e| e.to_string())?;
+    // The script is handed to PowerShell through its input, so nothing is
+    // written to disk. It must stay plain ASCII: the input has no fixed encoding.
     let mut cmd = Command::new("powershell.exe");
-    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&path)
-        .stdin(Stdio::null())
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", "& ([scriptblock]::Create([Console]::In.ReadToEnd()))"])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     #[cfg(windows)]
@@ -117,13 +150,12 @@ fn collect_windows() -> Result<Value, String> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = std::fs::remove_file(&path);
-            return Err(format!("Не удалось запустить PowerShell: {e}"));
-        }
-    };
+    let mut child = cmd.spawn().map_err(|e| format!("Не удалось запустить PowerShell: {e}"))?;
+    if let Some(mut input) = child.stdin.take() {
+        std::thread::spawn(move || {
+            let _ = input.write_all(script.as_bytes());
+        });
+    }
     // Read the answer on the side, so a stuck system query can be given up on.
     let (tx, rx) = std::sync::mpsc::channel();
     if let Some(mut pipe) = child.stdout.take() {
@@ -138,7 +170,6 @@ fn collect_windows() -> Result<Value, String> {
         let _ = child.kill();
     }
     let _ = child.wait();
-    let _ = std::fs::remove_file(&path);
     let bytes = got.map_err(|_| "Система не ответила вовремя".to_string())?;
     let text = String::from_utf8_lossy(&bytes);
     let text = text.trim_start_matches('\u{feff}').trim();
@@ -308,8 +339,41 @@ fn os_build(d: &Value) -> String {
 
 // ---------- pages ----------
 
+/// How the programs page is ordered.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppSort {
+    #[default]
+    Name,
+    Size,
+    Date,
+    Publisher,
+}
+
 pub fn page(id: &str, d: &Value) -> Page {
+    page_sorted(id, d, AppSort::Name)
+}
+
+pub fn page_sorted(id: &str, d: &Value, sort: AppSort) -> Page {
     match id {
+        "battery" => battery(d),
+        "startup" => listing(d, "startup", "Автозагрузка", "Name", |a| vec![s(a, "Command"), s(a, "Location")]),
+        "services" => listing(d, "services", "Службы с автозапуском", "DisplayName", |a| {
+            vec![match s(a, "State").as_str() {
+                "Running" => "Работает".to_string(),
+                "Stopped" => "Остановлена".to_string(),
+                other => other.to_string(),
+            }]
+        }),
+        "drivers" => listing(d, "drivers", "Драйверы сторонних производителей", "DeviceName", |a| {
+            let ver = s(a, "DriverVersion");
+            vec![if ver.is_empty() { ver } else { format!("версия {ver}") }, s(a, "DriverProviderName"), s(a, "Date")]
+        }),
+        "updates" => listing(d, "updates", "Обновления системы", "HotFixID", |a| vec![s(a, "Description"), s(a, "Date")]),
+        "usb" => listing(d, "usb", "Устройства USB", "Name", |a| vec![s(a, "Manufacturer")]),
+        "printers" => listing(d, "printers", "Принтеры", "Name", |a| {
+            let main = if a.get("Default") == Some(&Value::Bool(true)) { "основной" } else { "" };
+            vec![s(a, "DriverName"), s(a, "PortName"), main.to_string()]
+        }),
         "summary" => summary(d),
         "cpu" => cpu(d),
         "board" => board(d),
@@ -323,7 +387,7 @@ pub fn page(id: &str, d: &Value) -> Page {
         "pdisk" => pdisk(d),
         "ldisk" => ldisk(d),
         "net" => net(d),
-        "apps" => apps(d),
+        "apps" => apps(d, sort),
         _ => Page::new(),
     }
 }
@@ -733,6 +797,78 @@ fn pdisk(d: &Value) -> Page {
         sec.row("Версия прошивки", s(k, "FirmwareRevision"));
         sec.row("Серийный номер", s(k, "SerialNumber"));
         sec.row("Разделы", s(k, "Partitions"));
+        // Health counters, when the system gives them out.
+        if let Some(h) = list(d, "rel").iter().find(|x| s(x, "DeviceId") == s(k, "Index")) {
+            if let Some(x) = n(h, "Temperature").filter(|x| *x > 0.0) {
+                sec.row("Температура", format!("{} °C", x as u32));
+            }
+            if let Some(x) = n(h, "Wear") {
+                sec.row("Износ", format!("{} %", x as u32));
+            }
+            if let Some(x) = n(h, "PowerOnHours") {
+                sec.row("Наработка", format!("{} ч", x as u64));
+            }
+            sec.row("Ошибки чтения", s(h, "ReadErrors"));
+            sec.row("Ошибки записи", s(h, "WriteErrors"));
+        } else if d.get("admin") == Some(&Value::Bool(false)) {
+            sec.row("Подробности", "Температура и износ видны при запуске от имени администратора");
+        }
+    }
+    p
+}
+
+/// A plain list page: one section "Title (N)", one row per item, the value
+/// made of the non-empty parts.
+fn listing(d: &Value, key: &str, title: &str, name: &str, parts: impl Fn(&Value) -> Vec<String>) -> Page {
+    let mut p = Page::new();
+    let items = list(d, key);
+    let sec = p.section(&format!("{title} ({})", items.len()));
+    for a in &items {
+        let v: Vec<String> = parts(a).into_iter().filter(|x| !x.trim().is_empty()).collect();
+        sec.row(&s(a, name), if v.is_empty() { "—".to_string() } else { v.join("  ·  ") });
+    }
+    p.sections.retain(|s| !s.rows.is_empty());
+    p
+}
+
+fn battery(d: &Value) -> Page {
+    let mut p = Page::new();
+    let x = obj(d, "batx");
+    for b in list(d, "bat") {
+        let sec = p.section(&format!("Батарея  {}", s(b, "Name")).trim().to_string());
+        sec.row("Заряд", unit(s(b, "EstimatedChargeRemaining"), "%"));
+        sec.row(
+            "Питание",
+            match n(b, "BatteryStatus").unwrap_or(0.0) as u32 {
+                1 | 4 | 5 => "Разряжается",
+                3 => "Заряжена",
+                6..=9 => "Заряжается",
+                2 => "От сети",
+                _ => "",
+            },
+        );
+        // minutes; the system gives a huge number when it cannot tell
+        if let Some(m) = n(b, "EstimatedRunTime").filter(|m| *m > 0.0 && *m < 6000.0) {
+            sec.row("Осталось времени", format!("{} ч {} мин", m as u32 / 60, m as u32 % 60));
+        }
+        let unit_name = Some(s(x, "Unit")).filter(|u| !u.is_empty()).unwrap_or_else(|| "мВт·ч".into());
+        let full = n(x, "Full").unwrap_or(0.0);
+        let design = n(x, "Design").unwrap_or(0.0);
+        if full > 0.0 {
+            sec.row("Полная ёмкость", format!("{} {unit_name}", full as u64));
+        }
+        if design > 0.0 {
+            sec.row("Заводская ёмкость", format!("{} {unit_name}", design as u64));
+        }
+        if full > 0.0 && design > 0.0 {
+            sec.row("Износ", format!("{} %", (100.0 - full / design * 100.0).clamp(0.0, 100.0).round() as u32));
+        }
+        if let Some(c) = n(x, "Cycles").filter(|c| *c > 0.0) {
+            sec.row("Циклов заряда", (c as u64).to_string());
+        }
+    }
+    if p.sections.is_empty() {
+        p.section("Батарея").row("Статус", "Батарея не обнаружена");
     }
     p
 }
@@ -816,6 +952,60 @@ mod tests {
         let r = report("P", &p);
         assert!(r.contains(&format!("      Имя{}a\r\n", " ".repeat(31))));
         assert!(r.contains(&format!("      {long}  b\r\n")));
+    }
+
+    #[test]
+    fn script_is_plain_ascii() {
+        // It reaches PowerShell through its input, which has no fixed encoding.
+        assert!(SCRIPT.is_ascii());
+    }
+
+    #[test]
+    fn script_splits_into_two_whole_scripts() {
+        let [first, second] = script_halves();
+        for half in [&first, &second] {
+            assert!(half.starts_with("$ErrorActionPreference"));
+            assert!(half.contains("$r = [ordered]@{}"));
+            assert!(half.trim_end().ends_with("ConvertTo-Json -Depth 5 -Compress"));
+        }
+        assert!(first.contains("Win32_Processor") && !first.contains("Win32_Printer"));
+        assert!(second.contains("Win32_Printer") && !second.contains("Win32_Processor"));
+    }
+
+    #[test]
+    fn new_pages() {
+        let d = json!({
+            "admin": false,
+            "disk": [{ "Model": "SSD", "Index": 0, "Size": 1000 }],
+            "apps": [
+                { "Name": "beta", "SizeKb": 10, "Date": "20260101", "Publisher": "Zed" },
+                { "Name": "Alpha", "SizeKb": 500, "Date": "20250101", "Store": true },
+                { "Name": "Gamma", "SizeKb": 50, "Date": "20260601", "Publisher": "Acme" },
+            ],
+            "services": [{ "DisplayName": "Print Spooler", "State": "Running" }],
+            "printers": [{ "Name": "PDF", "DriverName": "Drv", "PortName": "P:", "Default": true }],
+            "bat": [{ "Name": "BAT0", "EstimatedChargeRemaining": 80, "BatteryStatus": 1, "EstimatedRunTime": 125 }],
+            "batx": { "Full": 40000, "Design": 50000, "Cycles": 120 },
+        });
+        let rows = |id: &str, sort: AppSort| -> Vec<(String, String)> {
+            page_sorted(id, &d, sort).sections.into_iter().flat_map(|s| s.rows).collect()
+        };
+        let names = |sort| rows("apps", sort).into_iter().map(|r| r.0).collect::<Vec<_>>();
+        assert_eq!(names(AppSort::Name), ["Alpha", "beta", "Gamma"]);
+        assert_eq!(names(AppSort::Size), ["Alpha", "Gamma", "beta"]);
+        assert_eq!(names(AppSort::Date), ["Gamma", "beta", "Alpha"]);
+        assert_eq!(names(AppSort::Publisher), ["Gamma", "beta", "Alpha"]);
+        assert!(rows("apps", AppSort::Name)[0].1.ends_with("Microsoft Store"));
+        assert_eq!(rows("services", AppSort::Name), [("Print Spooler".to_string(), "Работает".to_string())]);
+        assert_eq!(rows("printers", AppSort::Name)[0].1, "Drv  ·  P:  ·  основной");
+        let bat = rows("battery", AppSort::Name);
+        assert!(bat.contains(&("Заряд".into(), "80 %".into())));
+        assert!(bat.contains(&("Питание".into(), "Разряжается".into())));
+        assert!(bat.contains(&("Осталось времени".into(), "2 ч 5 мин".into())));
+        assert!(bat.contains(&("Износ".into(), "20 %".into())));
+        assert!(rows("pdisk", AppSort::Name).iter().any(|r| r.0 == "Подробности"));
+        assert!(page("usb", &d).sections.is_empty());
+        assert_eq!(rows("battery", AppSort::Name).len(), 7);
     }
 
     #[test]

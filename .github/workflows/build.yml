@@ -1,0 +1,66 @@
+name: Build
+
+# Every push and pull request: tests and a release build for Windows and Linux.
+# A tag like v0.3.0 also publishes both programs on the Releases page.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            file: target/release/syslens.exe
+            asset: syslens.exe
+          - os: ubuntu-latest
+            file: target/release/syslens
+            asset: syslens-linux-x86_64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Window and graphics packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Pack (Linux)
+        if: runner.os == 'Linux'
+        run: tar -czf syslens-linux-x86_64.tar.gz -C target/release syslens
+
+      - name: Pack (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cp target/release/syslens.exe syslens.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+      - name: Publish on the Releases page
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          notes="docs/release-${tag#v}.md"
+          # the first of the two jobs creates the release, the other finds it there
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "SysLens ${tag#v}" --notes-file "$notes" || true
+          gh release upload "$tag" "${{ matrix.asset }}" --clobber

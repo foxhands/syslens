@@ -1,6 +1,6 @@
 [package]
 name = "syslens"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Простая программа для Windows: сведения о процессоре, плате, памяти, видеокарте, дисках, сети и установленных программах"
 license = "MIT"
@@ -12,6 +12,12 @@ categories = ["gui"]
 eframe = "0.31"
 serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Live load: processor, memory, network, disks.
+sysinfo = { version = "0.33", default-features = false, features = ["system", "network", "disk"] }
+
+# The system's own "Save as" window.
+[target.'cfg(windows)'.dependencies]
+rfd = { version = "0.15", default-features = false }
 
 [profile.dev]
 opt-level = 1
