@@ -1,7 +1,8 @@
 name: Build
 
-# Every push and pull request: tests and a release build for Windows and Linux.
-# A tag like v0.3.0 also publishes both programs on the Releases page.
+# Every push and pull request: tests and release builds for Windows (x64, ARM64),
+# Linux (x64 with an AppImage, ARM64) and macOS (one program for Intel and Apple chips).
+# A tag like v0.4.0 also publishes everything on the Releases page.
 on:
   push:
     branches: [main]
@@ -17,13 +18,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            file: target/release/syslens.exe
-            asset: syslens.exe
-          - os: ubuntu-latest
-            file: target/release/syslens
-            asset: syslens-linux-x86_64.tar.gz
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            test: true
+          - name: windows-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            test: false # built on an x64 machine, cannot be run there
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            test: true
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            test: true
+          - name: macos
+            os: macos-latest
+            target: aarch64-apple-darwin
+            test: true
     runs-on: ${{ matrix.os }}
+    env:
+      # Optional code-signing certificate (see docs/distribution.md). Empty: nothing is signed.
+      SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+      SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,27 +50,93 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev file
+
+      - name: Rust targets
+        shell: bash
+        run: |
+          rustup target add ${{ matrix.target }}
+          if [ "${{ matrix.name }}" = "macos" ]; then rustup target add x86_64-apple-darwin; fi
 
       - name: Tests
+        if: matrix.test
         run: cargo test --locked
 
       - name: Release build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Pack (Linux)
-        if: runner.os == 'Linux'
-        run: tar -czf syslens-linux-x86_64.tar.gz -C target/release syslens
+      - name: Release build for Intel Macs
+        if: matrix.name == 'macos'
+        run: cargo build --release --locked --target x86_64-apple-darwin
 
       - name: Pack (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: cp target/release/syslens.exe syslens.exe
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.name }}" = "windows-x64" ]; then file=syslens.exe; else file=syslens-windows-arm64.exe; fi
+          cp "target/${{ matrix.target }}/release/syslens.exe" "dist/$file"
+
+      - name: Sign (Windows, only when a certificate is set in the repository secrets)
+        if: runner.os == 'Windows' && env.SIGN_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'sign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          $tool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' | Sort-Object FullName | Select-Object -Last 1
+          Get-ChildItem dist\*.exe | ForEach-Object {
+            & $tool.FullName sign /fd SHA256 /f $pfx /p $env:SIGN_PFX_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          Remove-Item $pfx
+
+      - name: Scoop and winget manifests (Windows x64)
+        if: matrix.name == 'windows-x64'
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          hash=$(sha256sum dist/syslens.exe | cut -d' ' -f1)
+          sed -e "s/VERSION/$version/g" -e "s/HASH/$hash/g" packaging/scoop.json > dist/syslens.json
+          mkdir -p winget
+          for f in packaging/winget/*.yaml; do
+            sed -e "s/VERSION/$version/g" -e "s/HASH/${hash^^}/g" "$f" > "winget/$(basename "$f")"
+          done
+          7z a dist/winget-manifest.zip ./winget/* > /dev/null
+
+      - name: Pack (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.name }}" = "linux-x64" ]; then arch=x86_64; else arch=arm64; fi
+          tar -czf "dist/syslens-linux-$arch.tar.gz" -C "target/${{ matrix.target }}/release" syslens
+
+      - name: AppImage (Linux x64)
+        if: matrix.name == 'linux-x64'
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp "target/${{ matrix.target }}/release/syslens" AppDir/usr/bin/syslens
+          cp assets/syslens.png AppDir/syslens.png
+          cp packaging/syslens.desktop AppDir/syslens.desktop
+          cp packaging/AppRun AppDir/AppRun
+          chmod +x AppDir/AppRun AppDir/usr/bin/syslens
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir dist/SysLens-x86_64.AppImage
+
+      - name: Pack (macOS)
+        if: matrix.name == 'macos'
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p dist SysLens.app/Contents/MacOS
+          lipo -create -output SysLens.app/Contents/MacOS/syslens \
+            target/aarch64-apple-darwin/release/syslens target/x86_64-apple-darwin/release/syslens
+          sed "s/VERSION/$version/g" packaging/Info.plist > SysLens.app/Contents/Info.plist
+          ditto -c -k --keepParent SysLens.app dist/SysLens-macos.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: syslens-${{ matrix.name }}
+          path: dist/
 
       - name: Publish on the Releases page
         if: startsWith(github.ref, 'refs/tags/v')
@@ -61,6 +146,6 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           notes="docs/release-${tag#v}.md"
-          # the first of the two jobs creates the release, the other finds it there
+          # the first job to get here creates the release, the others find it there
           gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "SysLens ${tag#v}" --notes-file "$notes" || true
-          gh release upload "$tag" "${{ matrix.asset }}" --clobber
+          gh release upload "$tag" dist/* --clobber

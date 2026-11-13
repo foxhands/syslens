@@ -44,6 +44,14 @@ $r.pdisk = @(Get-PhysicalDisk | Select-Object FriendlyName, @{n='Media'; e={ "$(
 $r.vol = @(Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -eq 3 -or $_.DriveType -eq 2 } | Select-Object DeviceID, VolumeName, FileSystem, Size, FreeSpace, DriveType)
 $r.net = @(Get-CimInstance Win32_NetworkAdapter -Filter 'PhysicalAdapter=True' | Select-Object Name, MACAddress, Speed, NetEnabled, Manufacturer)
 $r.ip = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Select-Object Description, IPAddress, DefaultIPGateway, DNSServerSearchOrder)
+# Firmware, Secure Boot and the security chip (TPM): what Windows 11 asks for.
+$tpm = ''
+# The chip is told by its hardware name, the same in every language: MSFT0101 is TPM 2.0, PNP0C31 is TPM 1.2.
+Get-CimInstance Win32_PnPEntity -Filter "PNPClass='SecurityDevices'" | ForEach-Object {
+    if ("$($_.PNPDeviceID)" -match 'MSFT0101') { $tpm = '2.0' }
+    elseif ("$($_.PNPDeviceID)" -match 'PNP0C31' -and -not $tpm) { $tpm = '1.2' }
+}
+$r.fw = [ordered]@{ Type = "$env:firmware_type"; SecureBoot = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State').UEFISecureBootEnabled; Tpm = $tpm }
 # --- SECOND HALF --- (programs and devices; the program runs it side by side with the first half)
 $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',

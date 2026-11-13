@@ -1,0 +1,22 @@
+{
+    "version": "VERSION",
+    "description": "System information: processor, motherboard, memory, graphics, disks, network and installed programs",
+    "homepage": "https://github.com/foxhands/syslens",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/foxhands/syslens/releases/download/vVERSION/syslens.exe",
+            "hash": "HASH"
+        }
+    },
+    "bin": "syslens.exe",
+    "shortcuts": [["syslens.exe", "SysLens"]],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/foxhands/syslens/releases/download/v$version/syslens.exe"
+            }
+        }
+    }
+}

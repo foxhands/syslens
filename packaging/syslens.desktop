@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=SysLens
+Comment=System information: processor, memory, graphics, disks, network, programs
+Comment[ru]=Сведения о системе: процессор, память, видеокарта, диски, сеть, программы
+Comment[uk]=Відомості про систему: процесор, пам'ять, відеокарта, диски, мережа, програми
+Comment[de]=Systeminformationen: Prozessor, Speicher, Grafik, Datenträger, Netzwerk, Programme
+Comment[es]=Información del sistema: procesador, memoria, gráficos, discos, red, programas
+Comment[pl]=Informacje o systemie: procesor, pamięć, grafika, dyski, sieć, programy
+Exec=syslens
+Icon=syslens
+Categories=System;Utility;
+Terminal=false
