@@ -1,0 +1,15 @@
+# Build output
+/target/
+
+# Local screenshots made while building
+/shots/
+
+# Local build settings (contain paths of this computer)
+/.cargo/
+
+# One-click upload helper for this computer
+/publish-to-github.cmd
+
+# Working notes of the builder, not part of the program
+/MECHANICS.md
+/mechanics.json

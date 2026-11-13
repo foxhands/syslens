@@ -1,0 +1,27 @@
+[package]
+name = "syslens"
+version = "0.2.0"
+edition = "2021"
+description = "Простая программа для Windows: сведения о процессоре, плате, памяти, видеокарте, дисках, сети и установленных программах"
+license = "MIT"
+readme = "README.md"
+keywords = ["windows", "system-info", "hardware", "egui"]
+categories = ["gui"]
+
+[dependencies]
+eframe = "0.31"
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Small, fast single file for GitHub releases.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
