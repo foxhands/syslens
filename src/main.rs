@@ -1,7 +1,10 @@
 #![windows_subsystem = "windows"]
 
+mod diff;
+mod export;
 mod i18n;
 mod info;
+mod live;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod linux;
 mod rules;
@@ -14,19 +17,45 @@ use std::sync::{Arc, Mutex};
 
 /// Menu tree: category, icon colour, pages (id, title).
 const TREE: &[(&str, [u8; 3], &[(&str, &str)])] = &[
-    ("Компьютер", [70, 120, 200], &[("summary", "Суммарная информация")]),
+    (
+        "Компьютер",
+        [70, 120, 200],
+        &[("summary", "Суммарная информация"), ("live", "Нагрузка сейчас"), ("changes", "Изменения"), ("battery", "Батарея")],
+    ),
     (
         "Системная плата",
         [60, 150, 90],
         &[("cpu", "ЦП"), ("board", "Системная плата"), ("memory", "Память"), ("spd", "SPD"), ("bios", "BIOS")],
     ),
-    ("Операционная система", [40, 140, 210], &[("os", "Операционная система")]),
+    ("Операционная система", [40, 140, 210], &[("os", "Операционная система"), ("updates", "Обновления системы")]),
     ("Отображение", [200, 110, 40], &[("gpu", "Видеоадаптер"), ("monitor", "Монитор")]),
     ("Мультимедиа", [170, 70, 170], &[("audio", "Звуковые устройства")]),
     ("Хранение данных", [120, 120, 130], &[("pdisk", "Физические диски"), ("ldisk", "Логические диски")]),
     ("Сеть", [40, 160, 160], &[("net", "Сетевые адаптеры")]),
-    ("Программы", [220, 170, 40], &[("apps", "Установленные программы")]),
+    ("Устройства", [150, 110, 70], &[("drivers", "Драйверы"), ("usb", "Устройства USB"), ("printers", "Принтеры")]),
+    (
+        "Программы",
+        [220, 170, 40],
+        &[("apps", "Установленные программы"), ("startup", "Автозагрузка"), ("services", "Службы")],
+    ),
 ];
+
+/// Pages that show something other than a list of facts about the computer;
+/// they stay out of the report, the search and the comparison.
+const SPECIAL: &[&str] = &["live", "changes"];
+
+/// Every ordinary page: (id, title).
+fn fact_pages() -> impl Iterator<Item = (&'static str, &'static str)> {
+    TREE.iter().flat_map(|c| c.2.iter().copied()).filter(|(id, _)| !SPECIAL.contains(id))
+}
+
+/// How pages are shown right now.
+struct View<'a> {
+    private: bool,
+    sort: info::AppSort,
+    /// The saved snapshot the "changes" page compares with.
+    baseline: Option<&'a Value>,
+}
 
 fn page_title(id: &str) -> String {
     for (_, _, pages) in TREE {
@@ -71,6 +100,15 @@ struct App {
     loading: bool,
     /// The last collection failed.
     failed: bool,
+    apps_sort: info::AppSort,
+    /// The saved snapshot, if one was ever taken.
+    baseline: Option<Arc<Value>>,
+    /// Live load; starts sampling when its page is first opened.
+    live: Option<live::Live>,
+}
+
+fn baseline_file() -> PathBuf {
+    config_dir().join("baseline.json")
 }
 
 /// Colours of the modern look for the current theme.
@@ -230,6 +268,9 @@ impl App {
             private: false,
             loading: false,
             failed: false,
+            apps_sort: info::AppSort::Name,
+            baseline: std::fs::read(baseline_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).map(Arc::new),
+            live: None,
         };
         app.refresh(&cc.egui_ctx);
         app
@@ -256,25 +297,67 @@ impl App {
     }
 
     fn save_report(&mut self) {
-        let Some(d) = &self.data else { return };
-        let mut text = format!("{}\r\n\r\n", t("Отчёт о системе (SysLens)"));
-        for (_, _, pages) in TREE {
-            for (id, title) in *pages {
-                text.push_str(&info::report(&t(title), &page_for(id, d, self.private)));
-            }
-        }
+        let Some(d) = self.data.clone() else { return };
         let mut dir = home().join("Documents");
         if !dir.is_dir() {
             dir = home();
         }
-        let path = dir.join(t("SysLens-отчёт.txt"));
-        let mut bytes = vec![0xEF, 0xBB, 0xBF];
-        bytes.extend_from_slice(text.as_bytes());
+        let name = t("SysLens-отчёт");
+        // The person picks the place and the kind of file: text, web page or JSON.
+        let path = match export::ask_path(&t("Сохранить отчёт"), &name, &dir) {
+            export::Ask::Chosen(p) => p,
+            export::Ask::Cancelled => return,
+            export::Ask::NoDialog => export::free_name(&dir, &name, "txt"),
+        };
+        let view = View { private: self.private, sort: self.apps_sort, baseline: None };
+        let bytes = export::render(export::format_of(&path), &t("Отчёт о системе (SysLens)"), &all_pages(&d, &view));
         self.status = match std::fs::write(&path, bytes) {
             Ok(_) => format!("Отчёт сохранён: {}", path.display()),
             Err(e) => format!("Не удалось сохранить отчёт: {e}"),
         };
     }
+
+    /// Remembers the computer as it is now, to show later what has changed.
+    fn save_baseline(&mut self) {
+        let Some(d) = self.data.clone() else { return };
+        let f = baseline_file();
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        self.status = match std::fs::write(&f, serde_json::to_vec(&*d).unwrap_or_default()) {
+            Ok(_) => {
+                self.baseline = Some(d);
+                "Снимок сохранён".into()
+            }
+            Err(e) => format!("Не удалось сохранить снимок: {e}"),
+        };
+    }
+}
+
+/// Every ordinary page with its title, as shown: for the report.
+fn all_pages(d: &Value, view: &View) -> Vec<(String, info::Page)> {
+    fact_pages().map(|(id, title)| (t(title), page_for(id, d, view))).collect()
+}
+
+/// Rows from all pages that contain `q` (lower case); a section whose title
+/// matches is kept whole. Sections are titled "page  ›  section".
+fn search_all(d: &Value, view: &View, q: &str) -> info::Page {
+    let mut out = info::Page { sections: Vec::new() };
+    for (id, title) in fact_pages() {
+        for mut s in page_for(id, d, view).sections {
+            if !s.title.to_lowercase().contains(q) {
+                s.rows.retain(|(k, v)| k.to_lowercase().contains(q) || v.to_lowercase().contains(q));
+            }
+            if !s.rows.is_empty() {
+                let page = t(title);
+                if s.title != page {
+                    s.title = format!("{page}  ›  {}", s.title);
+                }
+                out.sections.push(s);
+            }
+        }
+    }
+    out
 }
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -365,20 +448,24 @@ const PERSONAL: &[&str] = &[
 
 /// A page, with personal values replaced when `private` is on
 /// (for screenshots and reports that will be shared).
-fn page_for(id: &str, d: &serde_json::Value, private: bool) -> info::Page {
-    let mut page = info::page(id, d);
-    if private {
+fn page_for(id: &str, d: &serde_json::Value, view: &View) -> info::Page {
+    let mut page = match (id, view.baseline) {
+        ("changes", Some(old)) => diff::compare(&fact_pages().collect::<Vec<_>>(), old, d),
+        _ => info::page_sorted(id, d, view.sort),
+    };
+    if view.private {
         let user = std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).unwrap_or_default();
         hide_personal(&mut page, &user);
     }
     let l = i18n::get();
     if l != Lang::Ru {
         for s in &mut page.sections {
-            s.title = i18n::tr(&s.title, l);
+            // "page  ›  section": each part on its own
+            s.title = s.title.split("  ›  ").map(|part| i18n::tr(part, l)).collect::<Vec<_>>().join("  ›  ");
             for (k, v) in &mut s.rows {
                 *v = i18n::value(k, v, l);
-                // on the programs page the "field" is a program's own name
-                if id != "apps" {
+                // on list pages the "field" is the item's own name, not a label
+                if !OWN_NAMES.contains(&id) {
                     *k = i18n::tr(k, l);
                 }
             }
@@ -386,6 +473,9 @@ fn page_for(id: &str, d: &serde_json::Value, private: bool) -> info::Page {
     }
     page
 }
+
+/// Pages whose row names are names of programs, devices and the like.
+const OWN_NAMES: &[&str] = &["apps", "startup", "services", "drivers", "updates", "usb", "printers", "audio"];
 
 /// Replaces everything that identifies the computer or its owner.
 fn hide_personal(page: &mut info::Page, user: &str) {
@@ -618,7 +708,7 @@ impl eframe::App for App {
                     let icons = avail < 640.0;
                     let actions_w = if icons { 150.0 } else { 440.0 };
                     let edit = egui::TextEdit::singleline(&mut self.query)
-                        .hint_text(format!("🔍  {}", t("Поиск на этой странице…")))
+                        .hint_text(format!("🔍  {}", t("Поиск по всем страницам…")))
                         .desired_width((avail - actions_w - 90.0).clamp(100.0, 360.0))
                         .margin(egui::Margin::symmetric(10, 6));
                     ui.add(edit);
@@ -637,7 +727,8 @@ impl eframe::App for App {
                         }
                         if ui.button(label("📋", "Копировать")).on_hover_text(t("Копировать")).clicked() {
                             if let Some(d) = &self.data {
-                                ctx.copy_text(info::report(&page_title(self.selected), &page_for(self.selected, d, self.private)));
+                                let view = View { private: self.private, sort: self.apps_sort, baseline: self.baseline.as_deref() };
+                                ctx.copy_text(info::report(&page_title(self.selected), &page_for(self.selected, d, &view)));
                                 self.status = "Страница скопирована в буфер обмена".into();
                             }
                         }
@@ -670,24 +761,65 @@ impl eframe::App for App {
                     }
                     return;
                 };
-                let mut page = page_for(self.selected, &d, self.private);
+                let baseline = self.baseline.clone();
+                let view = View { private: self.private, sort: self.apps_sort, baseline: baseline.as_deref() };
                 let q = self.query.trim().to_lowercase();
                 let searching = !q.is_empty();
-                if searching {
-                    for s in &mut page.sections {
-                        let title_hit = s.title.to_lowercase().contains(&q);
-                        if !title_hit {
-                            s.rows.retain(|(k, v)| k.to_lowercase().contains(&q) || v.to_lowercase().contains(&q));
-                        }
-                    }
-                    page.sections.retain(|s| !s.rows.is_empty());
-                }
+                // A search looks through every page; otherwise the chosen page is shown.
+                let page = if searching { search_all(&d, &view, &q) } else { page_for(self.selected, &d, &view) };
                 let col = page_color(self.selected);
+                let shown = if searching { "" } else { self.selected };
+                if shown == "live" {
+                    // a new sample every second while this page is open
+                    let wait = self.live.get_or_insert_with(live::Live::new).tick();
+                    ctx.request_repaint_after(wait);
+                }
+                let mut copied: Option<String> = None;
+                let mut remember = false;
 
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    if self.selected == "summary" && !searching {
-                        tiles(ui, &pal, &page);
-                        ui.add_space(14.0);
+                    match shown {
+                        "summary" => {
+                            tiles(ui, &pal, &page);
+                            ui.add_space(14.0);
+                        }
+                        "live" => {
+                            if let Some(lv) = &self.live {
+                                live_page(ui, &pal, lv);
+                            }
+                        }
+                        "changes" => {
+                            card(&pal).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                let text = match &baseline {
+                                    Some(b) => format!("{} {}", t("Сравнение со снимком от"), diff::taken(b)),
+                                    None => t("Снимка ещё нет. Запомните текущее состояние — позже здесь будет видно, что изменилось: программы, драйверы, устройства."),
+                                };
+                                ui.add(egui::Label::new(RichText::new(text).color(pal.soft)).wrap());
+                                ui.add_space(8.0);
+                                if ui.button(format!("📌  {}", t("Запомнить текущее состояние"))).clicked() {
+                                    remember = true;
+                                }
+                            });
+                            ui.add_space(12.0);
+                        }
+                        "apps" => {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(t("Сортировка:")).color(pal.muted));
+                                for (sort, name) in [
+                                    (info::AppSort::Name, "по имени"),
+                                    (info::AppSort::Size, "по размеру"),
+                                    (info::AppSort::Date, "по дате"),
+                                    (info::AppSort::Publisher, "по издателю"),
+                                ] {
+                                    if ui.selectable_label(self.apps_sort == sort, t(name)).clicked() {
+                                        self.apps_sort = sort;
+                                    }
+                                }
+                            });
+                            ui.add_space(8.0);
+                        }
+                        _ => {}
                     }
                     for s in &page.sections {
                         card(&pal).show(ui, |ui| {
@@ -696,22 +828,22 @@ impl eframe::App for App {
                             ui.horizontal(|ui| {
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                                 ui.painter().circle_filled(r.center(), 5.0, col);
-                                ui.label(bold(&s.title, 15.0).color(pal.text));
+                                ui.add(egui::Label::new(bold(&s.title, 15.0).color(pal.text)).wrap());
                             });
                             ui.add_space(6.0);
                             let n = s.rows.len();
                             for (i, (k, v)) in s.rows.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(key_w, 22.0),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.set_min_width(key_w);
-                                            ui.add(egui::Label::new(RichText::new(k).color(pal.muted)).truncate());
-                                        },
-                                    );
-                                    ui.add_space(12.0);
-                                    ui.add(egui::Label::new(RichText::new(v).color(pal.text)).selectable(true));
+                                ui.horizontal_top(|ui| {
+                                    key_cell(ui, &pal, key_w, k);
+                                    // long values wrap inside the card; a click on a value copies it
+                                    ui.vertical(|ui| {
+                                        ui.set_max_width(ui.available_width());
+                                        ui.add_space(2.0);
+                                        let value = egui::Label::new(RichText::new(v).color(pal.text)).wrap().sense(egui::Sense::click());
+                                        if ui.add(value).on_hover_cursor(egui::CursorIcon::Copy).clicked() {
+                                            copied = Some(v.clone());
+                                        }
+                                    });
                                 });
                                 if i + 1 < n {
                                     ui.add_space(3.0);
@@ -724,10 +856,25 @@ impl eframe::App for App {
                         ui.add_space(12.0);
                     }
                     if page.sections.is_empty() {
-                        let msg = if searching { "Ничего не найдено" } else { "Нет данных" };
-                        ui.label(RichText::new(t(msg)).color(pal.muted));
+                        let msg = match shown {
+                            _ if searching => "Ничего не найдено",
+                            "live" => "",
+                            "changes" if baseline.is_some() => "Изменений нет",
+                            "changes" => "",
+                            _ => "Нет данных",
+                        };
+                        if !msg.is_empty() {
+                            ui.label(RichText::new(t(msg)).color(pal.muted));
+                        }
                     }
                 });
+                if let Some(text) = copied {
+                    ctx.copy_text(text);
+                    self.status = "Значение скопировано".into();
+                }
+                if remember {
+                    self.save_baseline();
+                }
             });
 
         if self.show_about {
@@ -766,7 +913,9 @@ impl App {
             }
             return;
         }
-        if !self.shot_sent && self.ready_frames >= 120 {
+        // The load page needs a few seconds of samples before it has a chart to show.
+        let sampled = self.selected != "live" || self.live.as_ref().map_or(false, |l| l.history.len() >= 4);
+        if !self.shot_sent && self.ready_frames >= 120 && sampled {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.shot_sent = true;
         }
@@ -786,6 +935,158 @@ impl App {
             std::process::exit(0);
         }
     }
+}
+
+/// The name column of a row: fixed width, cut with "…" when too long.
+fn key_cell(ui: &mut egui::Ui, pal: &Palette, key_w: f32, k: &str) {
+    ui.allocate_ui_with_layout(egui::vec2(key_w, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_min_width(key_w);
+        ui.add(egui::Label::new(RichText::new(k).color(pal.muted)).truncate());
+    });
+    ui.add_space(12.0);
+}
+
+/// A text of the live page in the current language ("9.1 ГБ из 16 ГБ").
+fn tv(s: &str) -> String {
+    i18n::value("", s, i18n::get())
+}
+
+/// A filled bar: how much of something is used. Nearly full turns red.
+fn bar(ui: &mut egui::Ui, pal: &Palette, width: f32, share: f32) {
+    let share = if share.is_finite() { share.clamp(0.0, 1.0) } else { 0.0 };
+    let (r, _) = ui.allocate_exact_size(egui::vec2(width, 10.0), egui::Sense::hover());
+    ui.painter().rect_filled(r, 5.0, pal.border);
+    if share > 0.0 {
+        let fill = if share >= 0.9 { Color32::from_rgb(225, 85, 85) } else { pal.accent };
+        let w = (r.width() * share).max(6.0);
+        ui.painter().rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(w, r.height())), 5.0, fill);
+    }
+}
+
+/// A row of the live page: name, bar, text.
+fn bar_row(ui: &mut egui::Ui, pal: &Palette, key_w: f32, name: &str, share: f32, text: &str) {
+    ui.horizontal(|ui| {
+        key_cell(ui, pal, key_w, name);
+        let w = (ui.available_width() * 0.4).clamp(80.0, 280.0);
+        bar(ui, pal, w, share);
+        ui.add_space(8.0);
+        ui.label(RichText::new(text).color(pal.text));
+    });
+    ui.add_space(4.0);
+}
+
+fn card_title(ui: &mut egui::Ui, pal: &Palette, dot: Color32, title: &str, right: &str) {
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+        ui.painter().circle_filled(r.center(), 5.0, dot);
+        ui.label(bold(title, 15.0).color(pal.text));
+        if !right.is_empty() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(bold(right, 18.0).color(pal.text));
+            });
+        }
+    });
+    ui.add_space(8.0);
+}
+
+/// The "load now" page: processor with a one-minute chart and its cores,
+/// memory, network speeds and disk space.
+fn live_page(ui: &mut egui::Ui, pal: &Palette, lv: &live::Live) {
+    let share = |used: u64, total: u64| if total > 0 { used as f32 / total as f32 } else { 0.0 };
+    let of = |used: u64, total: u64| tv(&format!("{} из {}", rules::size(used), rules::size(total)));
+
+    card(pal).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        card_title(ui, pal, page_color("cpu"), &t("Процессор"), &format!("{} %", lv.cpu.round() as u32));
+        // the last minute, newest on the right
+        let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 70.0), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(r, 6.0, pal.bg);
+        for line in 1..4 {
+            let y = r.top() + r.height() * line as f32 / 4.0;
+            p.hline(r.x_range(), y, Stroke::new(1.0_f32, pal.border));
+        }
+        let step = r.width() / (live::HISTORY - 1) as f32;
+        let start = live::HISTORY - lv.history.len();
+        let points: Vec<egui::Pos2> = lv
+            .history
+            .iter()
+            .enumerate()
+            .map(|(i, v)| egui::pos2(r.left() + step * (start + i) as f32, r.bottom() - 2.0 - (r.height() - 4.0) * (v / 100.0).clamp(0.0, 1.0)))
+            .collect();
+        if points.len() > 1 {
+            p.add(egui::Shape::line(points, Stroke::new(2.0_f32, pal.accent)));
+        }
+        ui.add_space(10.0);
+        ui.label(RichText::new(t("Загрузка по ядрам")).size(12.0).color(pal.muted));
+        ui.add_space(2.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            for (i, c) in lv.cores.iter().enumerate() {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(46.0, 10.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, 5.0, pal.border);
+                let w = r.width() * (c / 100.0).clamp(0.0, 1.0);
+                if w > 0.5 {
+                    ui.painter().rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(w.max(4.0), r.height())), 5.0, pal.accent);
+                }
+                resp.on_hover_text(format!("{}: {} %", i + 1, c.round() as u32));
+            }
+        });
+    });
+    ui.add_space(12.0);
+
+    card(pal).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        let key_w = (ui.available_width() * 0.36).clamp(180.0, 320.0);
+        card_title(ui, pal, page_color("memory"), &t("Память"), "");
+        bar_row(ui, pal, key_w, &t("Оперативная память"), share(lv.mem_used, lv.mem_total), &of(lv.mem_used, lv.mem_total));
+        if lv.swap_total > 0 {
+            bar_row(ui, pal, key_w, &t("Файл подкачки"), share(lv.swap_used, lv.swap_total), &of(lv.swap_used, lv.swap_total));
+        }
+    });
+    ui.add_space(12.0);
+
+    if !lv.nets_now.is_empty() {
+        card(pal).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let key_w = (ui.available_width() * 0.36).clamp(180.0, 320.0);
+            card_title(ui, pal, page_color("net"), &t("Сеть"), "");
+            for n in &lv.nets_now {
+                ui.horizontal(|ui| {
+                    key_cell(ui, pal, key_w, &n.name);
+                    let text = tv(&format!("↓ {}    ↑ {}", rules::rate(n.down), rules::rate(n.up)));
+                    ui.label(RichText::new(text).color(pal.text));
+                });
+                ui.add_space(4.0);
+            }
+        });
+        ui.add_space(12.0);
+    }
+
+    if !lv.disks_now.is_empty() {
+        card(pal).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let key_w = (ui.available_width() * 0.36).clamp(180.0, 320.0);
+            card_title(ui, pal, page_color("pdisk"), &t("Диски"), "");
+            for d in &lv.disks_now {
+                let used = d.total.saturating_sub(d.free);
+                bar_row(ui, pal, key_w, &d.name, share(used, d.total), &tv(&rules::space_line(d.total, d.free)));
+            }
+        });
+        ui.add_space(12.0);
+    }
+}
+
+/// `--report file`: collects the information and writes the report without
+/// opening a window. The kind of file follows its name (.txt, .html, .json).
+fn headless_report(path: &std::path::Path, private: bool) -> Result<(), String> {
+    let d = info::collect().map_err(|e| t(&e))?;
+    let view = View { private, sort: info::AppSort::Name, baseline: None };
+    let bytes = export::render(export::format_of(path), &t("Отчёт о системе (SysLens)"), &all_pages(&d, &view));
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -857,6 +1158,16 @@ fn main() -> eframe::Result<()> {
         }
     }
     let private = args.iter().any(|a| a == "--private");
+    // --report file: write the report and leave, no window.
+    if let Some(path) = args.iter().position(|a| a == "--report").and_then(|i| args.get(i + 1)) {
+        match headless_report(std::path::Path::new(path), private) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("SysLens: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     // Optional start page: --page apps
     let start: Option<&'static str> = args
         .iter()
