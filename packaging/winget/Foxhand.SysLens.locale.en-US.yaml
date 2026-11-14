@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: Foxhand.SysLens
+PackageVersion: VERSION
+PackageLocale: en-US
+Publisher: Foxhand
+PublisherUrl: https://github.com/foxhands
+PackageName: SysLens
+PackageUrl: https://github.com/foxhands/syslens
+License: MIT
+LicenseUrl: https://github.com/foxhands/syslens/blob/main/LICENSE
+ShortDescription: System information - processor, motherboard, memory, graphics, disks, network and installed programs.
+Tags:
+  - system-information
+  - hardware
+  - diagnostics
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

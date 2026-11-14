@@ -1,0 +1,4 @@
+# Files that run on Linux and macOS keep their line endings.
+packaging/AppRun text eol=lf
+packaging/syslens.desktop text eol=lf
+packaging/Info.plist text eol=lf

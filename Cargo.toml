@@ -1,8 +1,10 @@
 [package]
 name = "syslens"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Простая программа для Windows: сведения о процессоре, плате, памяти, видеокарте, дисках, сети и установленных программах"
+authors = ["Foxhand"]
+repository = "https://github.com/foxhands/syslens"
+description = "Простая программа для Windows, Linux и macOS: сведения о процессоре, плате, памяти, видеокарте, дисках, сети и установленных программах"
 license = "MIT"
 readme = "README.md"
 keywords = ["windows", "system-info", "hardware", "egui"]
@@ -15,9 +17,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Live load: processor, memory, network, disks.
 sysinfo = { version = "0.33", default-features = false, features = ["system", "network", "disk"] }
 
-# The system's own "Save as" window.
-[target.'cfg(windows)'.dependencies]
+# The system's own "Save as" and "Open" windows.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 rfd = { version = "0.15", default-features = false }
+
+# The icon next to the clock with processor and memory load.
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
 
 [profile.dev]
 opt-level = 1

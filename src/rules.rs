@@ -1,6 +1,8 @@
 //! Display rules: how sizes and the one-line descriptions on the summary page
 //! are written. Parts of a line are joined with " · ", like on the programs page.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 const SEP: &str = "  ·  ";
 
 /// A number with one decimal, without a trailing ".0": 8, 465.8.
@@ -9,12 +11,33 @@ fn num(x: f64) -> String {
     s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
 }
 
-/// A size in the largest unit that fits: "512 МБ", "8 ГБ", "465.8 ГБ", "1.8 ТБ".
-/// Units are binary (1 ГБ = 1024 МБ), the way Windows counts them.
-pub fn size(bytes: u64) -> String {
-    let kb = bytes as f64 / 1024.0;
-    let mb = kb / 1024.0;
-    let gb = mb / 1024.0;
+/// Disk sizes are counted the way the box says (1 ГБ = 1000 МБ) when this
+/// is on, otherwise the way Windows counts them (1 ГБ = 1024 МБ).
+static DECIMAL: AtomicBool = AtomicBool::new(false);
+
+pub fn set_decimal(on: bool) {
+    DECIMAL.store(on, Ordering::Relaxed);
+}
+
+pub fn decimal() -> bool {
+    DECIMAL.load(Ordering::Relaxed)
+}
+
+/// Runs `f` with Windows-style units whatever the person chose: the data
+/// two computers are compared by must not depend on a setting.
+pub fn with_binary<T>(f: impl FnOnce() -> T) -> T {
+    let was = decimal();
+    set_decimal(false);
+    let out = f();
+    set_decimal(was);
+    out
+}
+
+/// A size in the largest unit that fits, with `step` units in the next one.
+fn size_in(bytes: u64, step: f64) -> String {
+    let kb = bytes as f64 / step;
+    let mb = kb / step;
+    let gb = mb / step;
     if mb < 1.0 {
         format!("{} КБ", kb.round() as u64)
     } else if mb < 1000.0 {
@@ -22,8 +45,19 @@ pub fn size(bytes: u64) -> String {
     } else if gb < 1000.0 {
         format!("{} ГБ", num(gb))
     } else {
-        format!("{} ТБ", num(gb / 1024.0))
+        format!("{} ТБ", num(gb / step))
     }
+}
+
+/// A disk or file size: "512 МБ", "465.8 ГБ", "1.8 ТБ" — or "500.1 ГБ", "2 ТБ"
+/// when the person chose the units printed on the box.
+pub fn size(bytes: u64) -> String {
+    size_in(bytes, if decimal() { 1000.0 } else { 1024.0 })
+}
+
+/// A memory size: always 1 ГБ = 1024 МБ, nobody counts memory any other way.
+pub fn mem_size(bytes: u64) -> String {
+    size_in(bytes, 1024.0)
 }
 
 /// A transfer speed: "300 КБ/с", "1.2 ГБ/с".
@@ -36,7 +70,7 @@ pub fn memory_line(bytes: u64, mem_type: &str) -> String {
     if bytes == 0 {
         return "Неизвестно".into();
     }
-    join(&[size(bytes), mem_type.to_string()])
+    join(&[mem_size(bytes), mem_type.to_string()])
 }
 
 /// "AMD Ryzen 5 5600X  ·  6C/12T  ·  3.7 ГГц": name, cores and threads, clock.
@@ -66,9 +100,6 @@ pub fn space_line(total_bytes: u64, free_bytes: u64) -> String {
     format!("свободно {} из {}", size(free_bytes), size(total_bytes))
 }
 
-/// A volume with less free space than this share of its size gets a warning.
-pub const LOW_FREE_SHARE: f64 = 0.1;
-
 /// "Dell U2419H  ·  24\"": name and diagonal. The serial number and the year
 /// are on the monitor page.
 pub fn monitor_line(name: &str, diag_inch: Option<u32>) -> String {
@@ -78,7 +109,7 @@ pub fn monitor_line(name: &str, diag_inch: Option<u32>) -> String {
 
 /// One memory module: "8 ГБ  ·  DDR4-3200  ·  Kingston KF432C16BB/8".
 pub fn dimm_line(bytes: u64, mem_type: &str, speed: u32, maker: &str, part: &str) -> String {
-    let size = if bytes > 0 { size(bytes) } else { String::new() };
+    let size = if bytes > 0 { mem_size(bytes) } else { String::new() };
     let grade = match (mem_type.is_empty(), speed) {
         (true, 0) => String::new(),
         (true, s) => format!("{s} MT/s"),
@@ -110,6 +141,12 @@ mod tests {
         assert_eq!(size(8 << 30), "8 ГБ");
         assert_eq!(size(500_107_862_016), "465.8 ГБ");
         assert_eq!(size(2_000_398_934_016), "1.8 ТБ");
+        // the units printed on the box
+        assert_eq!(size_in(500_107_862_016, 1000.0), "500.1 ГБ");
+        assert_eq!(size_in(2_000_398_934_016, 1000.0), "2 ТБ");
+        assert_eq!(size_in(512_000_000, 1000.0), "512 МБ");
+        assert_eq!(mem_size(16 << 30), "16 ГБ");
+        assert_eq!(with_binary(|| size(8 << 30)), "8 ГБ");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::process::Command;
 const SCRIPT: &str = include_str!("collect.ps1");
 
 /// How long the Windows collection may take before it is given up on.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code))]
 const TIMEOUT_SECS: u64 = 90;
 
 /// "64 бит"; nothing when the number itself is missing.
@@ -81,13 +81,7 @@ fn apps(d: &Value, sort: AppSort) -> Page {
             parts.push(format!("{}.{}.{}", &date[6..8], &date[4..6], &date[0..4]));
         }
         if let Some(kb) = n(a, "SizeKb").filter(|k| *k > 0.0) {
-            parts.push(if kb >= 1024.0 * 1024.0 {
-                format!("{:.1} ГБ", kb / 1048576.0)
-            } else if kb >= 1024.0 {
-                format!("{} МБ", (kb / 1024.0).round() as u64)
-            } else {
-                format!("{} КБ", kb as u64)
-            });
+            parts.push(rules::size((kb * 1024.0) as u64));
         }
         if a.get("Store") == Some(&Value::Bool(true)) {
             parts.push("Microsoft Store".into());
@@ -100,17 +94,20 @@ fn apps(d: &Value, sort: AppSort) -> Page {
     p
 }
 
-/// Gathers everything: on Linux from /proc and /sys, elsewhere with the Windows script.
+/// Gathers everything: on Linux from /proc and /sys, on macOS from the
+/// system's own tools, elsewhere with the Windows script.
 pub fn collect() -> Result<Value, String> {
     #[cfg(target_os = "linux")]
     return crate::linux::collect();
+    #[cfg(target_os = "macos")]
+    return crate::mac::collect();
     #[allow(unreachable_code)]
     collect_windows()
 }
 
 /// The script as two scripts that can run at the same time: hardware, and
 /// programs with devices. Each gets the opening lines and the closing line.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn script_halves() -> [String; 2] {
     let (first, second) = SCRIPT.split_once("# --- SECOND HALF ---").unwrap_or((SCRIPT, ""));
     let head: String = SCRIPT.lines().take(3).map(|l| format!("{l}\n")).collect();
@@ -121,7 +118,7 @@ fn script_halves() -> [String; 2] {
 
 /// Runs both halves of the Windows collection script side by side and joins
 /// their answers: together they take about as long as the slower one.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn collect_windows() -> Result<Value, String> {
     let [first, second] = script_halves();
     let side = std::thread::spawn(move || run_script(second));
@@ -134,7 +131,7 @@ fn collect_windows() -> Result<Value, String> {
 }
 
 /// Runs one PowerShell script and returns its JSON.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code))]
 fn run_script(script: String) -> Result<Value, String> {
     use std::io::{Read, Write};
     use std::process::Stdio;
@@ -179,7 +176,7 @@ fn run_script(script: String) -> Result<Value, String> {
 
 // ---------- helpers ----------
 
-fn s(v: &Value, k: &str) -> String {
+pub(crate) fn s(v: &Value, k: &str) -> String {
     match v.get(k) {
         Some(Value::String(x)) => x.trim().to_string(),
         Some(Value::Number(n)) => n.to_string(),
@@ -193,7 +190,7 @@ fn s(v: &Value, k: &str) -> String {
     }
 }
 
-fn n(v: &Value, k: &str) -> Option<f64> {
+pub(crate) fn n(v: &Value, k: &str) -> Option<f64> {
     match v.get(k) {
         Some(Value::Number(x)) => x.as_f64(),
         Some(Value::String(x)) => x.trim().parse().ok(),
@@ -201,7 +198,7 @@ fn n(v: &Value, k: &str) -> Option<f64> {
     }
 }
 
-fn list<'a>(v: &'a Value, k: &str) -> Vec<&'a Value> {
+pub(crate) fn list<'a>(v: &'a Value, k: &str) -> Vec<&'a Value> {
     match v.get(k) {
         Some(Value::Array(a)) => a.iter().filter(|x| x.is_object()).collect(),
         Some(o @ Value::Object(_)) => vec![o],
@@ -209,7 +206,7 @@ fn list<'a>(v: &'a Value, k: &str) -> Vec<&'a Value> {
     }
 }
 
-fn obj<'a>(v: &'a Value, k: &str) -> &'a Value {
+pub(crate) fn obj<'a>(v: &'a Value, k: &str) -> &'a Value {
     static NULL: Value = Value::Null;
     match v.get(k) {
         Some(Value::Array(a)) => a.first().unwrap_or(&NULL),
@@ -237,12 +234,14 @@ fn gb_or_mb(bytes: f64) -> String {
     }
 }
 
-/// Volume sizes in binary megabytes, like "475834 МБ".
+/// Volume sizes in megabytes, like "475834 МБ" (or "500107 МБ" in the units
+/// printed on the box).
 fn vol_mb(bytes: f64) -> String {
-    format!("{} МБ", (bytes / MIB).floor() as u64)
+    let step = if rules::decimal() { 1e6 } else { MIB };
+    format!("{} МБ", (bytes / step).floor() as u64)
 }
 
-fn mem_type(code: f64) -> &'static str {
+pub(crate) fn mem_type(code: f64) -> &'static str {
     match code as u32 {
         20 => "DDR",
         21 => "DDR2",
@@ -308,7 +307,7 @@ fn slot_name(mods: &[&Value], i: usize) -> String {
     }
 }
 
-fn vram_of(d: &Value, gpu: &Value) -> Option<f64> {
+pub(crate) fn vram_of(d: &Value, gpu: &Value) -> Option<f64> {
     let name = s(gpu, "Name");
     for v in list(d, "vram") {
         if s(v, "Desc") == name {
@@ -318,7 +317,7 @@ fn vram_of(d: &Value, gpu: &Value) -> Option<f64> {
     n(gpu, "AdapterRAM").filter(|x| *x > 0.0)
 }
 
-fn os_name(d: &Value) -> String {
+pub(crate) fn os_name(d: &Value) -> String {
     let os = obj(d, "os");
     let x = obj(d, "osx");
     let mut name = s(os, "Caption");
@@ -425,14 +424,7 @@ fn summary(d: &Value) -> Page {
     let b = obj(d, "board");
     sec.row("Системная плата", format!("{} {}", s(b, "Manufacturer"), s(b, "Product")).trim().to_string());
     let mods = list(d, "mem");
-    let ty = mods
-        .first()
-        .and_then(|m| n(m, "SMBIOSMemoryType"))
-        .map(mem_type)
-        .unwrap_or("");
-    // What is installed: the modules added up; without module data, what the system sees.
-    let installed: u64 = mods.iter().filter_map(|m| n(m, "Capacity")).map(|x| x as u64).sum();
-    let total = if installed > 0 { installed } else { n(cs, "TotalPhysicalMemory").unwrap_or(0.0) as u64 };
+    let (total, ty) = installed_memory(d);
     sec.row("Системная память", rules::memory_line(total, ty));
     for (i, m) in mods.iter().enumerate() {
         sec.row(
@@ -454,7 +446,7 @@ fn summary(d: &Value) -> Page {
     for g in list(d, "gpu") {
         let mem = vram_of(d, g)
             .filter(|x| *x >= 1.0)
-            .map(|x| format!("  ·  {}", rules::size(x as u64)))
+            .map(|x| format!("  ·  {}", rules::mem_size(x as u64)))
             .unwrap_or_default();
         sec.row("Видеоадаптер", format!("{}{}", s(g, "Name"), mem));
     }
@@ -505,6 +497,59 @@ fn summary(d: &Value) -> Page {
     p
 }
 
+/// What is installed: the modules added up (without module data, what the
+/// system sees), and the kind of memory ("DDR4").
+pub(crate) fn installed_memory(d: &Value) -> (u64, &'static str) {
+    let mods = list(d, "mem");
+    let ty = mods.first().and_then(|m| n(m, "SMBIOSMemoryType")).map(mem_type).unwrap_or("");
+    let installed: u64 = mods.iter().filter_map(|m| n(m, "Capacity")).map(|x| x as u64).sum();
+    let total = if installed > 0 { installed } else { n(obj(d, "cs"), "TotalPhysicalMemory").unwrap_or(0.0) as u64 };
+    (total, ty)
+}
+
+/// The computer in one line, to paste into a chat:
+/// "Ryzen 5 5600X (6C/12T) / RTX 3060 12 ГБ / 32 ГБ DDR4 / SSD 465.8 ГБ NVMe / Windows 11 Pro".
+/// Nothing in it says whose computer it is.
+pub fn summary_line(d: &Value) -> String {
+    let tidy = |x: String| x.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(c) = list(d, "cpu").first() {
+        let cores = n(c, "NumberOfCores").unwrap_or(0.0) as u32;
+        let threads = n(c, "NumberOfLogicalProcessors").unwrap_or(0.0) as u32;
+        let count = match (cores, threads) {
+            (0, _) => String::new(),
+            (c, t) if t > c => format!(" ({c}C/{t}T)"),
+            (c, _) => format!(" ({c}C)"),
+        };
+        parts.push(format!("{}{count}", tidy(s(c, "Name"))));
+    }
+    let gpus: Vec<String> = list(d, "gpu")
+        .iter()
+        .map(|g| {
+            let mem = vram_of(d, g).filter(|x| *x >= 1.0).map(|x| format!(" {}", rules::mem_size(x as u64))).unwrap_or_default();
+            format!("{}{mem}", tidy(s(g, "Name")))
+        })
+        .filter(|x| !x.is_empty())
+        .collect();
+    parts.push(gpus.join(" + "));
+    let (total, ty) = installed_memory(d);
+    if total > 0 {
+        parts.push(format!("{} {ty}", rules::mem_size(total)).trim().to_string());
+    }
+    let disks: Vec<String> = list(d, "disk")
+        .iter()
+        .map(|k| {
+            let size = n(k, "Size").filter(|x| *x > 0.0).map(|x| rules::size(x as u64)).unwrap_or_default();
+            tidy(format!("{} {size} {}", s(k, "Model"), disk_bus(d, k)))
+        })
+        .filter(|x| !x.is_empty())
+        .collect();
+    parts.push(disks.join(" + "));
+    parts.push(tidy(os_name(d)));
+    parts.retain(|x| !x.is_empty());
+    parts.join(" / ")
+}
+
 /// Monitor value: maker, name and the diagonal from the screen's own size (cm).
 fn monitor_text(m: &Value) -> String {
     let name = format!("{} {}", s(m, "Maker"), s(m, "Name"));
@@ -516,7 +561,7 @@ fn monitor_text(m: &Value) -> String {
 
 /// How a disk is connected ("NVMe", "SATA", "USB"): from the storage list,
 /// else the older interface name.
-fn disk_bus(d: &Value, disk: &Value) -> String {
+pub(crate) fn disk_bus(d: &Value, disk: &Value) -> String {
     list(d, "pdisk")
         .iter()
         .find(|x| s(x, "DeviceId") == s(disk, "Index"))
@@ -731,7 +776,7 @@ fn gpu(d: &Value) -> Page {
         sec.row("Производитель", s(g, "AdapterCompatibility"));
         sec.row("Графический процессор", s(g, "VideoProcessor"));
         if let Some(x) = vram_of(d, g) {
-            sec.row("Объём видеопамяти", rules::size(x as u64));
+            sec.row("Объём видеопамяти", rules::mem_size(x as u64));
         }
         sec.row("Тип ЦАП", s(g, "AdapterDACType"));
         sec.row("ID устройства", s(g, "PNPDeviceID"));
@@ -887,12 +932,6 @@ fn ldisk(d: &Value) -> Page {
         sec.row("Свободно", vol_mb(free));
         if total > 0.0 {
             sec.row("Свободно %", format!("{} %", (free / total * 100.0).round() as u32));
-            if free / total < rules::LOW_FREE_SHARE {
-                sec.row(
-                    "Предупреждение",
-                    format!("На диске {} свободно лишь {}%.", s(v, "DeviceID"), (free / total * 100.0) as u32),
-                );
-            }
         }
     }
     p
@@ -1006,6 +1045,26 @@ mod tests {
         assert!(rows("pdisk", AppSort::Name).iter().any(|r| r.0 == "Подробности"));
         assert!(page("usb", &d).sections.is_empty());
         assert_eq!(rows("battery", AppSort::Name).len(), 7);
+    }
+
+    #[test]
+    fn one_line_summary() {
+        let d = json!({
+            "cs": { "Name": "ANNA-PC", "UserName": "anna" },
+            "os": { "Caption": "Windows 11 Pro" },
+            "osx": { "DisplayVersion": "24H2" },
+            "cpu": [{ "Name": "AMD Ryzen 5 5600X   6-Core Processor ", "NumberOfCores": 6, "NumberOfLogicalProcessors": 12 }],
+            "gpu": [{ "Name": "RTX 3060", "AdapterRAM": 12884901888u64 }],
+            "mem": [{ "Capacity": 17179869184u64, "SMBIOSMemoryType": 26 }, { "Capacity": 17179869184u64, "SMBIOSMemoryType": 26 }],
+            "disk": [{ "Model": "CT500P3SSD8", "Size": 500107862016u64, "InterfaceType": "SCSI", "Index": 0 }],
+            "pdisk": [{ "DeviceId": "0", "Bus": "NVMe" }],
+        });
+        assert_eq!(
+            summary_line(&d),
+            "AMD Ryzen 5 5600X 6-Core Processor (6C/12T) / RTX 3060 12 ГБ / 32 ГБ DDR4 / CT500P3SSD8 465.8 ГБ NVMe / Windows 11 Pro 24H2"
+        );
+        assert!(!summary_line(&d).contains("ANNA") && !summary_line(&d).contains("anna"));
+        assert_eq!(summary_line(&json!({})), "");
     }
 
     #[test]
