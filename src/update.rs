@@ -21,22 +21,27 @@ pub enum State {
     Failed,
 }
 
-/// "v0.4.0" or "0.4.0-beta" → [0, 4, 0].
-fn numbers(v: &str) -> Vec<u64> {
-    v.trim()
-        .trim_start_matches('v')
+/// "v0.4.0" or "0.4.0-rc.1+build" → ([0, 4, 0], whether it is a pre-release).
+/// The numbers stop at the first `-` (pre-release) or `+` (build mark).
+fn parts(v: &str) -> (Vec<u64>, bool) {
+    let v = v.trim().trim_start_matches('v');
+    let cut = v.find(['-', '+']).unwrap_or(v.len());
+    let numbers = v[..cut]
         .split('.')
         .map(|part| part.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0))
-        .collect()
+        .collect();
+    (numbers, v[cut..].starts_with('-'))
 }
 
-/// Whether version `a` is newer than version `b`.
+/// Whether version `a` is newer than version `b`. A pre-release is older
+/// than the release with the same numbers; two pre-releases of one version
+/// count as equal.
 pub fn newer(a: &str, b: &str) -> bool {
-    let (mut a, mut b) = (numbers(a), numbers(b));
+    let ((mut a, a_pre), (mut b, b_pre)) = (parts(a), parts(b));
     let len = a.len().max(b.len());
     a.resize(len, 0);
     b.resize(len, 0);
-    a > b
+    (a, !a_pre) > (b, !b_pre)
 }
 
 /// The answer of the releases service → what to tell the person.
@@ -80,6 +85,26 @@ mod tests {
         assert!(!newer("0.4.0", "0.4.0"));
         assert!(!newer("v0.3.9", "0.4.0"));
         assert!(!newer("garbage", "0.4.0"));
+    }
+
+    #[test]
+    fn pre_releases() {
+        // the release is newer than its own release candidate
+        assert!(newer("0.5.0", "0.5.0-rc.1"));
+        assert!(!newer("v0.5.0-rc.1", "0.5.0"));
+        assert!(!newer("0.5.0-rc.2", "0.5.0-rc.1"));
+        assert!(!newer("0.5.0-beta", "0.5.0-beta"));
+        assert!(!newer("0.5-rc.1", "0.5.0"));
+        // but a candidate of the next version is newer than this one
+        assert!(newer("v0.5.0-rc.1", "0.4.0"));
+        assert!(newer("0.5.0-rc.1", "0.4.9"));
+        assert!(!newer("0.4.0", "0.5.0-rc.1"));
+        assert!(newer("0.5.1", "0.5.0-rc.1"));
+        // a build mark is neither a number nor a pre-release
+        assert!(!newer("0.5.0+build.7", "0.5.0"));
+        assert!(!newer("0.5.0", "0.5.0+build.7"));
+        assert!(newer("0.5.0+build.7", "0.5.0-rc.1+build.9"));
+        assert!(newer("0.5.0+a-b", "0.5.0-rc.1"));
     }
 
     #[test]

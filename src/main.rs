@@ -250,6 +250,42 @@ fn save_setting(name: &str, text: &str) {
     let _ = std::fs::write(dir.join(name), text);
 }
 
+/// Writes a file that only its owner may read (where the system knows owners).
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    // a file left from an earlier version keeps the rights it had
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)
+}
+
+/// The part of a picture of `size` pixels that `rect` (in points) covers,
+/// as rows of RGBA bytes with their width and height. The picture may be of
+/// another frame than the rectangle (the window was resized in between), so
+/// the rectangle is cut to the picture; `None` when nothing is left.
+fn crop(img: &egui::ColorImage, rect: egui::Rect, ppp: f32) -> Option<(Vec<u8>, usize, usize)> {
+    let [w, h] = img.size;
+    // NaN and negative numbers become 0, numbers too large the picture's edge
+    let px = |v: f32, max: usize| ((v * ppp).max(0.0) as usize).min(max);
+    let (x0, x1, y0, y1) = (px(rect.min.x, w), px(rect.max.x, w), px(rect.min.y, h), px(rect.max.y, h));
+    if x1 <= x0 || y1 <= y0 || img.pixels.len() < w * h {
+        return None;
+    }
+    let raw = (y0..y1).flat_map(|y| &img.pixels[y * w + x0..y * w + x1]).flat_map(|c| c.to_array()).collect();
+    Some((raw, x1 - x0, y1 - y0))
+}
+
 /// Dark unless the person switched to light earlier.
 fn load_dark() -> bool {
     setting("theme.txt").map_or(true, |s| s != "light")
@@ -342,6 +378,12 @@ impl App {
         app
     }
 
+    /// The status line as shown: it may name a saved file, and with it the
+    /// owner's folder, which a shared picture must not show.
+    fn status_text(&self, private: bool) -> String {
+        shown_status(&t(&self.status), private.then(privacy::account).as_ref())
+    }
+
     fn view(&self, private: bool) -> View<'_> {
         View { private, sort: self.apps_sort, other: self.other.as_ref().map(|o| &o.1) }
     }
@@ -389,8 +431,11 @@ impl App {
         let Some(d) = self.data.clone() else { return };
         let view = View { private: self.private, sort: self.apps_sort, other: None };
         let page = export::print_page(&t("Отчёт о системе (SysLens)"), &all_pages(&d, &view));
-        let path = std::env::temp_dir().join("SysLens-print.html");
-        self.status = match std::fs::write(&path, page) {
+        // in the program's own folder: the shared one for temporary files is open to everyone
+        let dir = config_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("SysLens-print.html");
+        self.status = match write_private(&path, page.as_bytes()) {
             Ok(_) if export::open(&path.display().to_string()) => {
                 "Отчёт открыт в браузере: выберите принтер или «Сохранить как PDF»".into()
             }
@@ -456,6 +501,15 @@ fn report_bytes(path: &std::path::Path, d: &Value, private: bool, sort: info::Ap
     export::render(export::format_of(path), &t("Отчёт о системе (SysLens)"), &all_pages(d, &view), &compare)
 }
 
+/// A text that may hold a path (the status line, a disk's name), with the
+/// owner's folder hidden when `hide` names the owner.
+fn shown_status(text: &str, hide: Option<&privacy::Names>) -> String {
+    match hide {
+        Some(names) => privacy::hide_user(text, names),
+        None => text.to_string(),
+    }
+}
+
 /// Every ordinary page with its title, as shown: for the report.
 fn all_pages(d: &Value, view: &View) -> Vec<(String, info::Page)> {
     fact_pages().map(|(id, title)| (t(title), page_for(id, d, view))).collect()
@@ -493,6 +547,7 @@ fn page_for(id: &str, d: &Value, view: &View) -> info::Page {
 fn finish(id: &str, mut page: info::Page, view: &View) -> info::Page {
     if view.private {
         privacy::hide_personal(&mut page, &privacy::account());
+        privacy::hide_lan(id, &mut page);
     }
     let l = i18n::get();
     // the advice page is written in the chosen language from the start
@@ -521,23 +576,32 @@ fn pin_name(id: &str, section: &str, key: &str) -> String {
     format!("{id}\t{}\t{key}", diff::plain_title(section))
 }
 
+/// The pin names of a page's rows, section by section. A row that repeats
+/// (the second "Видеоадаптер") gets its number added: "…\t2".
+fn pin_names(id: &str, page: &info::Page) -> Vec<Vec<String>> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut name = |section: &str, key: &str| {
+        let pin = pin_name(id, section, key);
+        let n = seen.entry(pin.clone()).or_insert(0);
+        *n += 1;
+        if *n == 1 { pin } else { format!("{pin}\t{n}") }
+    };
+    page.sections.iter().map(|s| s.rows.iter().map(|(k, _)| name(&s.title, k)).collect()).collect()
+}
+
 /// A page as shown, each row with its pin name. Judgements and differences
 /// are not pinned: they are not facts with a fixed place.
 fn shown(id: &str, d: &Value, view: &View) -> Vec<Sec> {
     let plain = plain_page(id, d, view);
     let can_pin = id != "advice" && id != "compare";
-    let pins: Vec<Vec<Option<String>>> = plain
-        .sections
-        .iter()
-        .map(|s| s.rows.iter().map(|(k, _)| can_pin.then(|| pin_name(id, &s.title, k))).collect())
-        .collect();
+    let pins = pin_names(id, &plain);
     finish(id, plain, view)
         .sections
         .into_iter()
         .zip(pins)
         .map(|(s, pins)| Sec {
             title: s.title,
-            rows: s.rows.into_iter().zip(pins).map(|((key, value), pin)| Row { key, value, pin }).collect(),
+            rows: s.rows.into_iter().zip(pins).map(|((key, value), pin)| Row { key, value, pin: can_pin.then_some(pin) }).collect(),
         })
         .collect()
 }
@@ -865,7 +929,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 self.header(ctx, ui, &pal);
                 if !self.status.is_empty() {
-                    ui.label(RichText::new(t(&self.status)).size(12.0).color(pal.muted));
+                    ui.label(RichText::new(self.status_text(private)).size(12.0).color(pal.muted));
                 }
                 ui.add_space(10.0);
                 self.toolbar(ctx, ui, &pal, private);
@@ -1030,7 +1094,7 @@ impl App {
             if self.failed {
                 // Nothing to show and nothing running: say why and offer another try.
                 ui.add_space(24.0);
-                ui.label(RichText::new(t(&self.status)).color(pal.soft));
+                ui.label(RichText::new(self.status_text(private)).color(pal.soft));
                 ui.add_space(8.0);
                 if ui.button(format!("🔄  {}", t("Повторить"))).clicked() {
                     self.refresh(ctx);
@@ -1039,7 +1103,7 @@ impl App {
                 ui.centered_and_justified(|ui| {
                     ui.horizontal_centered(|ui| {
                         ui.spinner();
-                        ui.label(RichText::new(t(&self.status)).color(pal.soft));
+                        ui.label(RichText::new(self.status_text(private)).color(pal.soft));
                     });
                 });
             }
@@ -1083,7 +1147,7 @@ impl App {
                 }
                 "live" => {
                     if let Some(lv) = &self.live {
-                        live_page(ui, pal, lv);
+                        live_page(ui, pal, lv, private.then(privacy::account).as_ref());
                     }
                 }
                 "compare" => {
@@ -1249,7 +1313,10 @@ impl App {
         };
         self.snap = Snap::Idle;
         // only the page, without the menu on the left
-        let part = img.region(&self.content_rect, Some(ctx.pixels_per_point()));
+        let Some((raw, w, h)) = crop(&img, self.content_rect, ctx.pixels_per_point()) else {
+            self.status = "Не удалось сохранить картинку".into();
+            return;
+        };
         let dir = docs_dir();
         let name = format!("SysLens-{}", self.selected);
         let path = match export::ask_path(&t("Сохранить страницу как картинку"), &name, &dir, export::PICTURE_KINDS) {
@@ -1257,8 +1324,6 @@ impl App {
             export::Ask::Cancelled => return,
             export::Ask::NoDialog => export::free_name(&dir, &name, "png"),
         };
-        let raw: Vec<u8> = part.pixels.iter().flat_map(|c| c.to_array()).collect();
-        let [w, h] = part.size;
         self.status = match image::save_buffer(&path, &raw, w as u32, h as u32, image::ExtendedColorType::Rgba8) {
             Ok(_) => format!("Картинка сохранена: {}", path.display()),
             Err(e) => format!("Не удалось сохранить картинку: {e}"),
@@ -1363,8 +1428,9 @@ fn card_title(ui: &mut egui::Ui, pal: &Palette, dot: Color32, title: &str, right
 }
 
 /// The "load now" page: processor with a one-minute chart and its cores,
-/// memory, network speeds and disk space.
-fn live_page(ui: &mut egui::Ui, pal: &Palette, lv: &live::Live) {
+/// memory, network speeds and disk space. Disks are named by where they are
+/// mounted, which may be the owner's folder: `hide` names what to hide.
+fn live_page(ui: &mut egui::Ui, pal: &Palette, lv: &live::Live, hide: Option<&privacy::Names>) {
     let share = |used: u64, total: u64| if total > 0 { used as f32 / total as f32 } else { 0.0 };
     let of = |used: u64, total: u64| tv(&format!("{} из {}", rules::mem_size(used), rules::mem_size(total)));
 
@@ -1443,7 +1509,7 @@ fn live_page(ui: &mut egui::Ui, pal: &Palette, lv: &live::Live) {
             card_title(ui, pal, page_color("pdisk"), &t("Диски"), "");
             for d in &lv.disks_now {
                 let used = d.total.saturating_sub(d.free);
-                bar_row(ui, pal, key_w, &d.name, share(used, d.total), &tv(&rules::space_line(d.total, d.free)));
+                bar_row(ui, pal, key_w, &shown_status(&d.name, hide), share(used, d.total),&tv(&rules::space_line(d.total, d.free)));
             }
         });
         ui.add_space(12.0);
@@ -1487,6 +1553,56 @@ mod tests {
         assert_eq!(rows.iter().map(|r| (r.key.as_str(), r.value.as_str())).collect::<Vec<_>>(), [("B", "версия 2"), ("Тип ЦП", "X")]);
         // judgements and differences have no fixed place to pin
         assert!(shown("advice", &d, &view).iter().flat_map(|s| s.rows.iter()).all(|r| r.pin.is_none()));
+    }
+
+    #[test]
+    fn repeated_rows_are_pinned_apart() {
+        let d = json!({ "gpu": [{ "Name": "Intel UHD" }, { "Name": "GeForce RTX" }] });
+        let view = View { private: false, sort: info::AppSort::Name, other: None };
+        let summary = shown("summary", &d, &view);
+        let pins: Vec<String> =
+            summary.iter().flat_map(|s| s.rows.iter()).filter(|r| r.key == "Видеоадаптер").filter_map(|r| r.pin.clone()).collect();
+        // the first keeps the name it always had: pins saved by earlier versions still work
+        assert_eq!(pins, ["summary\tОтображение\tВидеоадаптер", "summary\tОтображение\tВидеоадаптер\t2"]);
+        let rows = favorite_rows(&pins[1..], &d, &view);
+        assert_eq!(rows.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(), ["GeForce RTX"]);
+        assert_eq!(favorite_rows(&pins[..1], &d, &view)[0].value, "Intel UHD");
+    }
+
+    #[test]
+    fn a_picture_is_cut_to_what_it_holds() {
+        let img = egui::ColorImage::new([4, 2], Color32::WHITE);
+        let rect = |x0: f32, y0: f32, x1: f32, y1: f32| egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
+        let (raw, w, h) = crop(&img, rect(1.0, 0.0, 2.0, 1.0), 2.0).unwrap();
+        assert_eq!((raw.len(), w, h), (2 * 2 * 4, 2, 2));
+        // the window was larger when the rectangle was measured
+        let (raw, w, h) = crop(&img, rect(1.0, -5.0, 900.0, 700.0), 1.0).unwrap();
+        assert_eq!((raw.len(), w, h), (3 * 2 * 4, 3, 2));
+        assert!(crop(&img, rect(50.0, 0.0, 900.0, 700.0), 1.0).is_none());
+        assert!(crop(&img, egui::Rect::NOTHING, 1.0).is_none());
+        assert!(crop(&img, egui::Rect::NAN, 1.0).is_none());
+    }
+
+    #[test]
+    fn the_status_line_hides_the_owner_in_private_mode() {
+        let names = privacy::Names::of(&["anna"]);
+        let status = "Картинка сохранена: /home/anna/Documents/SysLens-cpu.png";
+        assert_eq!(shown_status(status, Some(&names)), "Картинка сохранена: /home/***/Documents/SysLens-cpu.png");
+        assert_eq!(shown_status(status, None), status);
+    }
+
+    #[test]
+    fn the_print_file_is_for_its_owner_only() {
+        let path = std::env::temp_dir().join(format!("syslens-test-{}.html", std::process::id()));
+        std::fs::write(&path, "an older, longer file").unwrap();
+        write_private(&path, b"page").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"page");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

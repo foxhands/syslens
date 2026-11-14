@@ -41,9 +41,10 @@ pub type Fact = (String, String, String);
 
 /// The facts of one page worth comparing. Rows that identify the computer or
 /// its owner are left out: they always differ and are nobody else's business.
-pub fn facts(id: &str, d: &Value, user: &str) -> Vec<Fact> {
+pub fn facts(id: &str, d: &Value, user: &privacy::Names) -> Vec<Fact> {
     let mut out = Vec::new();
     let mut page = rules::with_binary(|| info::page(id, d));
+    privacy::hide_lan(id, &mut page);
     for s in &mut page.sections {
         s.title = privacy::hide_user(&s.title, user);
         let title = plain_title(&s.title);
@@ -60,7 +61,7 @@ pub fn facts(id: &str, d: &Value, user: &str) -> Vec<Fact> {
 }
 
 /// The part of the JSON report another SysLens compares with.
-pub fn to_json(pages: &[(&str, &str)], d: &Value, user: &str) -> Value {
+pub fn to_json(pages: &[(&str, &str)], d: &Value, user: &privacy::Names) -> Value {
     let pages: Vec<Value> = pages
         .iter()
         .map(|(id, _)| {
@@ -108,7 +109,7 @@ pub fn parse(report: &Value) -> Result<Other, String> {
 
 /// A page of differences: one section per place that differs, titled
 /// "page  ›  section"; rows say what only one computer has and what differs.
-pub fn compare(pages: &[(&str, &str)], other: &Other, this: &Value, user: &str) -> Page {
+pub fn compare(pages: &[(&str, &str)], other: &Other, this: &Value, user: &privacy::Names) -> Page {
     let mut result = Page { sections: Vec::new() };
     for (id, page_title) in pages {
         let mut theirs: Vec<Fact> = other.pages.iter().find(|p| p.0 == *id).map(|p| p.1.clone()).unwrap_or_default();
@@ -152,6 +153,10 @@ mod tests {
     const PAGES: [(&str, &str); 4] =
         [("os", "Операционная система"), ("apps", "Установленные программы"), ("usb", "Устройства USB"), ("board", "Системная плата")];
 
+    fn names(user: &str) -> privacy::Names {
+        privacy::Names::of(&[user])
+    }
+
     fn other_pc() -> Value {
         json!({
             "os": { "Now": "01.01.2026 / 10:00", "UptimeSec": 10, "RegisteredUser": "boris@example.com", "WindowsDirectory": "C:\\Users\\boris\\W" },
@@ -181,11 +186,11 @@ mod tests {
     #[test]
     fn finds_what_differs() {
         // the other computer's facts travel through its JSON report
-        let report = json!({ "program": "SysLens", "compare": to_json(&PAGES, &other_pc(), "boris") });
+        let report = json!({ "program": "SysLens", "compare": to_json(&PAGES, &other_pc(), &names("boris")) });
         let text = serde_json::to_string(&report).unwrap();
         let other = parse(&serde_json::from_str(&text).unwrap()).unwrap();
         assert_eq!(other.made, "01.01.2026 10:00");
-        let p = compare(&PAGES, &other, &this_pc(), "anna");
+        let p = compare(&PAGES, &other, &this_pc(), &names("anna"));
         // time, uptime, names and serial numbers differ, but they are not compared; USB is the same
         assert_eq!(p.sections.len(), 1);
         let s = &p.sections[0];
@@ -197,7 +202,7 @@ mod tests {
 
     #[test]
     fn the_report_part_holds_nothing_personal() {
-        let text = serde_json::to_string(&to_json(&PAGES, &other_pc(), "boris")).unwrap();
+        let text = serde_json::to_string(&to_json(&PAGES, &other_pc(), &names("boris"))).unwrap();
         for secret in ["boris", "BORIS-PC", "111"] {
             assert!(!text.contains(secret), "{secret}");
         }
@@ -205,10 +210,19 @@ mod tests {
     }
 
     #[test]
+    fn printers_are_compared_without_the_neighbours() {
+        let d = json!({ "printers": [{ "Name": "\\\\OFFICE-PC\\HP", "DriverName": "Drv", "PortName": "IP_192.168.1.50" }] });
+        let rows = facts("printers", &d, &names("anna"));
+        assert_eq!(rows, [("Принтеры".to_string(), "\\\\***\\HP".to_string(), "Drv  ·  IP_***".to_string())]);
+        let text = serde_json::to_string(&to_json(&[("printers", "Принтеры")], &d, &names("anna"))).unwrap();
+        assert!(!text.contains("OFFICE-PC") && !text.contains("192.168"));
+    }
+
+    #[test]
     fn same_computer_has_no_differences() {
         let d = this_pc();
-        let other = parse(&json!({ "program": "SysLens", "compare": to_json(&PAGES, &d, "") })).unwrap();
-        assert!(compare(&PAGES, &other, &d, "").sections.is_empty());
+        let other = parse(&json!({ "program": "SysLens", "compare": to_json(&PAGES, &d, &names("")) })).unwrap();
+        assert!(compare(&PAGES, &other, &d, &names("")).sections.is_empty());
     }
 
     #[test]

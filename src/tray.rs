@@ -34,20 +34,26 @@ mod imp {
 
     pub struct Tray {
         stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Tray {
         pub fn start(ctx: egui::Context) -> Tray {
             let stop = Arc::new(AtomicBool::new(false));
             let flag = stop.clone();
-            std::thread::spawn(move || run(ctx, flag));
-            Tray { stop }
+            let thread = Some(std::thread::spawn(move || run(ctx, flag)));
+            Tray { stop, thread }
         }
     }
 
     impl Drop for Tray {
+        /// Waits for the thread, which takes the icon away as it ends;
+        /// left alone at exit it would die first and leave a ghost icon.
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 
@@ -58,14 +64,12 @@ mod imp {
     fn run(ctx: egui::Context, stop: Arc<AtomicBool>) {
         let Some(first) = picture(0.0, 0.0) else { return };
         let Ok(tray) = TrayIconBuilder::new().with_tooltip("SysLens").with_icon(first).build() else { return };
-        // a click on the icon brings the window back
-        TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                ctx.request_repaint();
-            }
-        }));
+        // The clicks are read from the crate's channel in the loop. Its event
+        // handler can be set only once per process, so it would not survive
+        // the icon being switched off and on again.
+        let events = TrayIconEvent::receiver();
+        // what nobody read while the icon was off
+        while events.try_recv().is_ok() {}
         let mut sys = sysinfo::System::new();
         sys.refresh_cpu_usage();
         let mut last = Instant::now();
@@ -78,6 +82,14 @@ mod imp {
                 while PeekMessageW(&mut msg, 0, 0, 0, 1) != 0 {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
+                }
+            }
+            // a click on the icon brings the window back
+            while let Ok(event) = events.try_recv() {
+                if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.request_repaint();
                 }
             }
             if last.elapsed() >= Duration::from_secs(1) {
@@ -97,7 +109,6 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(40));
         }
-        TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
     }
 }
 
@@ -131,5 +142,19 @@ mod tests {
         let tray = TrayIconBuilder::new().with_tooltip("SysLens").with_icon(picture(0.1, 0.2)).build().unwrap();
         tray.set_icon(Some(picture(0.9, 0.5))).unwrap();
         tray.set_tooltip(Some("SysLens\nCPU: 90 %\nMemory: 50 %")).unwrap();
+    }
+
+    /// The icon's thread ends when the icon is dropped, also the second time
+    /// (off and on again in the settings). Run by hand, as the one above.
+    #[test]
+    #[ignore]
+    fn tray_stops_with_its_thread() {
+        for _ in 0..2 {
+            let tray = super::Tray::start(eframe::egui::Context::default());
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let begun = std::time::Instant::now();
+            drop(tray);
+            assert!(begun.elapsed() < std::time::Duration::from_secs(2));
+        }
     }
 }

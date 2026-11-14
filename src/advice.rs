@@ -262,7 +262,8 @@ fn outdated(d: &Value, today: Option<i64>, o: &mut Out) {
         .filter(|x| years(x.0) >= PROGRAM_OLD_YEARS)
         .collect();
     old.sort();
-    listed(o, "Программы, не обновлявшиеся более 3 лет", old, "установлена {0}");
+    // the date is that of installing: programs that update themselves do not touch it
+    listed(o, "Программы, установленные более 3 лет назад", old, "установлена {0}");
 }
 
 /// A section "Title (N)" with the oldest items by name and "и ещё N" for the rest.
@@ -279,15 +280,35 @@ fn listed(o: &mut Out, title: &str, items: Vec<(i64, String, String)>, template:
     }
 }
 
+/// How the requirements checked so far have come out.
+#[derive(Default)]
+struct Tally {
+    /// At least one requirement is not met.
+    failed: bool,
+    /// At least one requirement could not be told.
+    unknown: bool,
+}
+
+impl Tally {
+    fn add(&mut self, met: Option<bool>) {
+        match met {
+            Some(true) => {}
+            Some(false) => self.failed = true,
+            None => self.unknown = true,
+        }
+    }
+}
+
 /// One requirement: Some(true) met, Some(false) not met, None could not be told.
-fn check(o: &mut Out, key: &str, met: Option<bool>, text: String) -> bool {
+/// Gives `met` back so that it can be counted.
+fn check(o: &mut Out, key: &str, met: Option<bool>, text: String) -> Option<bool> {
     let (mark, text) = match met {
         Some(true) => ("✔", text),
         Some(false) => ("✖", text),
         None => ("?", i18n::tr("не удалось определить", o.l)),
     };
     o.raw(i18n::tr(key, o.l), format!("{mark}  {text}"));
-    met == Some(true)
+    met
 }
 
 fn windows11(d: &Value, o: &mut Out) {
@@ -296,7 +317,7 @@ fn windows11(d: &Value, o: &mut Out) {
     let l = o.l;
     let tr = |x: &str| i18n::tr(x, l);
     o.section("Готовность к Windows 11");
-    let mut ok = true;
+    let mut tally = Tally::default();
 
     let cpu = list(d, "cpu");
     let c = cpu.first().copied().unwrap_or(&Value::Null);
@@ -304,32 +325,32 @@ fn windows11(d: &Value, o: &mut Out) {
     let bits = n(c, "AddressWidth").unwrap_or(0.0);
     let mhz = n(c, "MaxClockSpeed").unwrap_or(0.0);
     let met = if cpu.is_empty() { None } else { Some(cores >= 2.0 && bits >= 64.0 && mhz >= 1000.0) };
-    ok &= check(o, "Процессор: 64 бита, от 2 ядер, от 1 ГГц", met, tr(if met == Some(true) { "подходит" } else { "не подходит" }));
+    tally.add(check(o, "Процессор: 64 бита, от 2 ядер, от 1 ГГц", met, tr(if met == Some(true) { "подходит" } else { "не подходит" })));
 
     let (total, _) = info::installed_memory(d);
     let met = if total == 0 { None } else { Some(total as f64 >= 3.5 * GIB) };
-    ok &= check(o, "Память: от 4 ГБ", met, i18n::value("", &rules::mem_size(total), l));
+    tally.add(check(o, "Память: от 4 ГБ", met, i18n::value("", &rules::mem_size(total), l)));
 
     let letter: String = s(obj(d, "os"), "WindowsDirectory").chars().take(2).collect();
     let system = volumes(d).into_iter().find(|v| v.0.eq_ignore_ascii_case(&letter));
     let met = system.as_ref().map(|v| v.1 >= 60e9);
     let text = system.as_ref().map(|v| i18n::value("", &rules::size(v.1 as u64), l)).unwrap_or_default();
-    ok &= check(o, "Системный диск: от 64 ГБ", met, text);
+    tally.add(check(o, "Системный диск: от 64 ГБ", met, text));
 
     let kind = s(fw, "Type");
     let met = if kind.is_empty() { None } else { Some(kind.eq_ignore_ascii_case("UEFI")) };
-    ok &= check(o, "Загрузка через UEFI", met, kind.clone());
+    tally.add(check(o, "Загрузка через UEFI", met, kind.clone()));
 
     let met = match (n(fw, "SecureBoot"), kind.is_empty()) {
         (Some(x), _) => Some(x == 1.0),
         (None, false) => Some(false),
         (None, true) => None,
     };
-    ok &= check(o, "Secure Boot", met, tr(if met == Some(true) { "включён" } else { "выключен или не поддерживается" }));
+    tally.add(check(o, "Secure Boot", met, tr(if met == Some(true) { "включён" } else { "выключен или не поддерживается" })));
 
     let tpm = s(fw, "Tpm");
     let met = Some(tpm.starts_with('2'));
-    ok &= check(o, "Модуль TPM 2.0", met, if tpm.is_empty() { tr("не найден") } else { format!("TPM {tpm}") });
+    tally.add(check(o, "Модуль TPM 2.0", met, if tpm.is_empty() { tr("не найден") } else { format!("TPM {tpm}") }));
 
     // not a requirement of Windows 11 itself, but the update will not install without room
     if let Some(v) = &system {
@@ -339,13 +360,15 @@ fn windows11(d: &Value, o: &mut Out) {
 
     let verdict = if s(obj(d, "os"), "Caption").contains("Windows 11") {
         "На этом компьютере уже стоит Windows 11."
-    } else if ok {
-        "Компьютер подходит для Windows 11."
-    } else {
+    } else if tally.failed {
         "Компьютер не подходит для Windows 11: выполнены не все требования."
+    } else if tally.unknown {
+        "Часть требований Windows 11 проверить не удалось (строки с «?»), остальные выполнены."
+    } else {
+        // only the basics are checked here: Setup also wants a processor from Microsoft's list
+        "Основные требования Windows 11 выполнены. Модель процессора со списком Microsoft не сверялась."
     };
     o.say("Итог", verdict, &[]);
-    o.say("Примечание", "Модель процессора со списком Microsoft не сверяется.", &[]);
 }
 
 #[cfg(test)]
@@ -447,14 +470,38 @@ mod tests {
             "✔  UEFI",
             "✔  включён",
             "✔  TPM 2.0",
-            "Компьютер подходит для Windows 11.",
+            "Основные требования Windows 11 выполнены. Модель процессора со списком Microsoft не сверялась.",
         ] {
             assert!(has(&all, part), "нет строки: {part}\n{all:#?}");
         }
         let en = rows(&d, Lang::En);
         assert!(has(&en, "No obvious bottlenecks."));
-        assert!(has(&en, "This computer is ready for Windows 11."));
+        assert!(has(&en, "The basic Windows 11 requirements are met. The processor model was not compared with Microsoft's list."));
         assert!(en.iter().any(|r| r.0 == "Windows 11 readiness" && r.1 == "Memory: 4 GB or more" && r.2 == "✔  32 GB"));
+    }
+
+    #[test]
+    fn an_unknown_requirement_is_not_a_failed_one() {
+        // no processor and no memory modules in the report: two rows cannot be told
+        let d = json!({
+            "os": { "Now": "14.11.2026 / 12:00", "Caption": "Windows 10 Pro", "WindowsDirectory": "C:\\WINDOWS" },
+            "vol": [{ "DeviceID": "C:", "Size": 500e9, "FreeSpace": 300e9, "DriveType": 3 }],
+            "fw": { "Type": "UEFI", "SecureBoot": 1, "Tpm": "2.0" },
+        });
+        let all = rows(&d, Lang::Ru);
+        assert!(has(&all, "?  не удалось определить"), "{all:#?}");
+        assert!(has(&all, "Часть требований Windows 11 проверить не удалось (строки с «?»), остальные выполнены."), "{all:#?}");
+        assert!(!has(&all, "не подходит для Windows 11"));
+        assert!(!has(&all, "Основные требования Windows 11 выполнены"));
+        let en = rows(&d, Lang::En);
+        assert!(has(&en, "Some Windows 11 requirements could not be checked (rows marked “?”); the rest are met."), "{en:#?}");
+
+        // a failed requirement outweighs an unknown one
+        let mut d = d;
+        d["fw"]["Tpm"] = json!("1.2");
+        let all = rows(&d, Lang::Ru);
+        assert!(has(&all, "?  не удалось определить"));
+        assert!(has(&all, "Компьютер не подходит для Windows 11: выполнены не все требования."), "{all:#?}");
     }
 
     #[test]

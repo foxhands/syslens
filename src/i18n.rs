@@ -366,13 +366,12 @@ const TABLE: &[Row] = &[
     ("Готовность к Windows 11", "Windows 11 readiness", "Готовність до Windows 11"),
     ("Драйверы старше 5 лет", "Drivers older than 5 years", "Драйвери, старші за 5 років"),
     (
-        "Программы, не обновлявшиеся более 3 лет",
-        "Programs not updated for more than 3 years",
-        "Програми, що не оновлювалися понад 3 роки",
+        "Программы, установленные более 3 лет назад",
+        "Programs installed more than 3 years ago",
+        "Програми, встановлені понад 3 роки тому",
     ),
     ("Перезагрузка", "Restart", "Перезавантаження"),
     ("Итог", "Verdict", "Підсумок"),
-    ("Примечание", "Note", "Примітка"),
     ("Слоты памяти", "Memory slots free", "Слоти пам'яті"),
     ("Максимум памяти", "Memory limit", "Максимум пам'яті"),
     ("Обновления Windows", "Windows updates", "Оновлення Windows"),
@@ -483,16 +482,20 @@ const TABLE: &[Row] = &[
         "This computer already runs Windows 11.",
         "На цьому комп'ютері вже встановлено Windows 11.",
     ),
-    ("Компьютер подходит для Windows 11.", "This computer is ready for Windows 11.", "Комп'ютер підходить для Windows 11."),
+    (
+        "Основные требования Windows 11 выполнены. Модель процессора со списком Microsoft не сверялась.",
+        "The basic Windows 11 requirements are met. The processor model was not compared with Microsoft's list.",
+        "Основні вимоги Windows 11 виконано. Модель процесора зі списком Microsoft не звірялася.",
+    ),
+    (
+        "Часть требований Windows 11 проверить не удалось (строки с «?»), остальные выполнены.",
+        "Some Windows 11 requirements could not be checked (rows marked “?”); the rest are met.",
+        "Частину вимог Windows 11 перевірити не вдалося (рядки з «?»), решту виконано.",
+    ),
     (
         "Компьютер не подходит для Windows 11: выполнены не все требования.",
         "This computer is not ready for Windows 11: not all requirements are met.",
         "Комп'ютер не підходить для Windows 11: виконано не всі вимоги.",
-    ),
-    (
-        "Модель процессора со списком Microsoft не сверяется.",
-        "The processor model is not checked against Microsoft's list.",
-        "Модель процесора зі списком Microsoft не звіряється.",
     ),
     // comparison of two computers
     ("Сравнение", "Comparison", "Порівняння"),
